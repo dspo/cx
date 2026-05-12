@@ -9,6 +9,7 @@ default:
 
 variables:
   CARGO_TERM_COLOR: always
+  ZIG_VERSION: "0.13.0"
 
 fmt:
   stage: validate
@@ -40,19 +41,23 @@ build:linux-x86_64:
 
 build:darwin-arm64:
   stage: build
-  tags:
-    - macos
-  rules:
-    - if: '$ENABLE_MACOS_RELEASE == "1"'
-    - when: never
+  image: rust:1.85
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends curl xz-utils ca-certificates
+    - curl --fail --show-error --location --output zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+    - tar -xf zig.tar.xz
+    - export PATH="${PWD}/zig-linux-x86_64-${ZIG_VERSION}:${PATH}"
+    - cargo install --locked cargo-zigbuild
+    - rustup target add aarch64-apple-darwin
   script:
     - |
       if [ -n "${CI_COMMIT_TAG:-}" ]; then
         export CX_ENFORCE_EMBEDDED_SECRETS=1
       fi
-    - cargo build --release
+    - cargo zigbuild --release --target aarch64-apple-darwin
     - mkdir -p dist
-    - cp target/release/cx dist/cx-darwin-arm64
+    - cp target/aarch64-apple-darwin/release/cx dist/cx-darwin-arm64
   artifacts:
     paths:
       - dist/
@@ -69,10 +74,7 @@ publish:release-assets:
     - test -d dist
     - test -n "$(find dist -maxdepth 1 -type f | head -n 1)"
     - test -f dist/cx-linux-x86_64
-    - |
-      if [ "${ENABLE_MACOS_RELEASE:-0}" = "1" ]; then
-        test -f dist/cx-darwin-arm64
-      fi
+    - test -f dist/cx-darwin-arm64
     - VERSION="${CI_COMMIT_TAG#v}"
     - PACKAGE_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/cx/${VERSION}"
     - cp scripts/install-release.sh dist/install.sh
@@ -111,16 +113,15 @@ publish:release-assets:
 
 release:
   stage: release
-  image: registry.gitlab.com/gitlab-org/cli:latest
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
   rules:
     - if: '$CI_COMMIT_TAG'
   needs:
     - publish:release-assets
+  variables:
+    GITLAB_TOKEN: $CI_JOB_TOKEN
   script:
-    - : "${GITLAB_RELEASE_TOKEN:?set GITLAB_RELEASE_TOKEN with api scope}"
-    - export GITLAB_HOST="${CI_SERVER_HOST}"
-    - export GITLAB_TOKEN="${GITLAB_RELEASE_TOKEN}"
-    - glab release create "${CI_COMMIT_TAG}" --name "Release ${CI_COMMIT_TAG}" --notes "Internal build ${CI_COMMIT_TAG}" --assets-links "$(cat release-links.json)"
+    - release-cli create --tag-name "${CI_COMMIT_TAG}" --name "Release ${CI_COMMIT_TAG}" --description "Internal build ${CI_COMMIT_TAG}" --assets-link "$(cat release-links.json)"
 
 publish:npm:
   stage: publish
