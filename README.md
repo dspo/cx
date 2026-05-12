@@ -1,93 +1,110 @@
-# cx
+# cx internal edition
 
+`cx` internal edition is a Rust TUI launcher for `copilot`, `claude`, and `codex`.
+This edition is designed for GitLab-hosted internal distribution:
 
+- provider/model config is embedded at build time
+- normal usage is gated by GitLab login
+- GitLab CI builds and publishes release assets
+- GitLab Release install script is the primary installation path
+- npm/npx is provided as a secondary GitLab-based distribution path
 
-## Getting started
+## Runtime model
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+- `cx`: choose agent first, then provider/model
+- `cx <agent> [args...]`: skip agent selection, still choose provider/model
+- after selection, passthrough args are forwarded unchanged to the native CLI
+- for `codex`, `cx` injects a synthetic DashScope provider view before launch, so it does not depend on the user already having `~/.codex/config.toml`
+- `cx` does **not** proxy `codex app`
+- this internal edition must complete `cx login` before `cx`, `cx <agent> ...`, or `cx probe`
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+## Login commands
 
-## Add your files
-
-* [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
+```bash
+cx login
+cx whoami
+cx logout
 ```
-cd existing_repo
-git remote add origin https://git.huayi.tech/awesome/cx.git
-git branch -M main
-git push -uf origin main
+
+`cx login` uses GitLab OAuth Authorization Code + PKCE against `https://git.huayi.tech`
+with callback `http://127.0.0.1:38081/callback`.
+
+## Install from GitLab Release
+
+This is the primary installation path for internal users.
+
+```bash
+export CX_GITLAB_TOKEN=<gitlab-personal-access-token>
+curl -fsSL \
+  -H "PRIVATE-TOKEN: ${CX_GITLAB_TOKEN}" \
+  "https://git.huayi.tech/awesome/cx/-/releases/permalink/latest/downloads/install.sh" | sh
 ```
 
-## Integrate with your tools
+The script downloads the latest matching release asset, verifies `SHA256SUMS`,
+and installs `cx` to `~/.local/bin/cx` by default.
 
-* [Set up project integrations](https://git.huayi.tech/awesome/cx/-/settings/integrations)
+## Install with npx
 
-## Collaborate with your team
+`npx` is available as a secondary GitLab-based path. Because the project and
+release assets are private, users must configure npm registry auth and provide a
+GitLab token for the wrapper to download the native binary.
 
-* [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+```bash
+npm config set @awesome:registry https://git.huayi.tech/api/v4/projects/<project-id>/packages/npm/
+npm config set -- //git.huayi.tech/api/v4/projects/<project-id>/packages/npm/:_authToken=<gitlab-token>
 
-## Test and Deploy
+export CX_GITLAB_TOKEN=<gitlab-personal-access-token>
+npx @awesome/cx login
+```
 
-Use the built-in continuous integration in GitLab.
+## Build-time embedded config
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+The internal edition no longer reads `~/.config/cx/config.yaml` at runtime.
+Instead, `build.rs` embeds `config/internal.config.yaml` into the binary and
+substitutes these CI variables if present:
 
-***
+- `CX_DASHSCOPE_API_KEY`
+- `CX_ANTHROPIC_API_KEY`
+- `CX_MIMO_API_KEY`
 
-# Editing this README
+Optional embedded GitLab settings:
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+- `CX_GITLAB_BASE_URL`
+- `CX_GITLAB_CLIENT_ID`
+- `CX_GITLAB_CALLBACK_URL`
+- `CX_GITLAB_SCOPES`
 
-## Suggestions for a good README
+For release builds, CI should set:
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+- `CX_ENFORCE_EMBEDDED_SECRETS=1`
+- `GITLAB_RELEASE_TOKEN` (GitLab token with API scope for creating releases)
 
-## Name
-Choose a self-explaining name for your project.
+If the secret variables are absent in local development, the build falls back to
+placeholder values so `cargo test` still works.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+For `codex`, only models verified to work through the injected DashScope
+responses provider are exposed in the embedded config.
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+## GitLab CI delivery
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+`.gitlab-ci.yml` provides:
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+1. `cargo fmt --check`
+2. `cargo test`
+3. release binary build jobs
+4. upload to GitLab Generic Package Registry
+5. GitLab Release creation with permanent asset links
+6. npm package publish to the GitLab npm registry
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+## Local development
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+```bash
+./scripts/build.sh
+cargo test
+```
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+For a local binary install from source:
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+```bash
+./scripts/install.sh
+```
