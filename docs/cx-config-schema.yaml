@@ -1,0 +1,56 @@
+# cx 配置文件结构（推荐版）
+#
+# 设计目标：
+# 1. Provider 表达“厂商 / 服务商”
+# 2. Provider 下声明该厂商暴露的协议端点（anthropic / responses / completions）
+# 3. models 使用以 model id 为 key 的 map，天然保证唯一性
+# 4. 每个 model 通过 wire_apis 表达自己兼容哪些协议
+# 5. agent 只声明自己支持哪些协议，cx 运行时自动推导 Provider / Model 可见性
+
+providers:
+  - name: "string (required, unique)"
+    apikey_source: "string (optional)"
+    agents: ["string (optional override filter)"]
+    endpoints:
+      anthropic:
+        url: "string (required)"
+        agents: ["string (optional override filter)"]
+        copilot_auth: "enum: api_key | bearer_token (optional)"
+      responses:
+        url: "string (required)"
+      completions:
+        url: "string (required)"
+    models:
+      model-id:
+        arena: "string (optional)"
+        swe_p: "string (optional)"
+        tb2: "string (optional)"
+        desc: "string (optional)"
+        wire_apis: ["enum: anthropic | responses | completions"]
+        agents: ["string (optional override filter)"]
+
+agents:
+  - id: "string (required, unique)"
+    bin: "string (required; binary is accepted as alias)"
+    wire_apis: ["enum: anthropic | responses | completions"]
+
+# 运行时语义
+#
+# 1. 默认兼容性由下面两层自动推导：
+#    - provider.endpoints.<wire_api>
+#    - agents[].wire_apis
+#
+# 2. 若 provider.agents / endpoints.<wire_api>.agents / models.<id>.agents 出现，
+#    它们只作为额外过滤器，不承担主绑定职责。
+#
+# 3. models.<id>.wire_apis 缺省时，表示兼容该 Provider 下所有已声明 endpoints。
+#
+# 4. 同名模型在多个协议下都可用时，按以下优先级为每个 agent 去重并优先显示：
+#    anthropic > responses > completions
+#
+# 5. 不同 agent 的启动映射：
+#    - copilot + anthropic   -> COPILOT_PROVIDER_TYPE=anthropic
+#    - copilot + responses   -> COPILOT_PROVIDER_TYPE=openai + WIRE_API=responses
+#    - copilot + completions -> COPILOT_PROVIDER_TYPE=openai + WIRE_API=completions
+#    - claude  + anthropic   -> ANTHROPIC_BASE_URL / ANTHROPIC_MODEL
+#    - codex   + responses   -> 注入 synthetic provider config 后启动

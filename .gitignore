@@ -1,0 +1,4 @@
+/target
+.omx/
+dist/
+npm/.npmrc
