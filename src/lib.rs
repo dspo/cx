@@ -25,7 +25,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 // 配置结构体（从 YAML 反序列化）
 // ══════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct CxConfig {
     #[serde(default)]
     providers: Vec<ProviderConfig>,
@@ -33,7 +33,7 @@ struct CxConfig {
     agents: Vec<AgentConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ProviderConfig {
     name: String,
     #[serde(default)]
@@ -44,7 +44,7 @@ struct ProviderConfig {
     endpoints: Vec<EndpointConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct EndpointConfig {
     wire_api: String,
     url: String,
@@ -52,7 +52,7 @@ struct EndpointConfig {
     models: Vec<ModelConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ModelConfig {
     id: String,
     #[serde(default)]
@@ -67,7 +67,7 @@ struct ModelConfig {
     agents: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct AgentConfig {
     id: String,
     binary: String,
@@ -395,9 +395,17 @@ fn models_for_provider(
 // ══════════════════════════════════════════════════
 
 pub fn run() -> Result<()> {
+    let args: Vec<String> = env::args().skip(1).collect();
+
+    // patch command does not require a config file
+    if args.first().map(String::as_str) == Some("patch") {
+        let invocation = parse_invocation(args, &CxConfig::default());
+        return run_patch(&invocation);
+    }
+
     let config = load_config()?;
 
-    match parse_invocation(env::args().skip(1).collect(), &config) {
+    match parse_invocation(args, &config) {
         Invocation::Help => {
             print_help();
             Ok(())
@@ -412,6 +420,9 @@ pub fn run() -> Result<()> {
             agent_hint,
             passthrough_args,
         } => run_launcher(agent_hint, &config, passthrough_args),
+        Invocation::Patch { .. } => {
+            unreachable!("patch is handled before config load")
+        }
     }
 }
 
@@ -428,6 +439,10 @@ enum Invocation {
     Launch {
         agent_hint: Option<String>,
         passthrough_args: Vec<String>,
+    },
+    Patch {
+        url: Option<String>,
+        refresh: bool,
     },
 }
 
@@ -449,6 +464,25 @@ fn parse_invocation(args: Vec<String>, config: &CxConfig) -> Invocation {
             Invocation::Unsupported {
                 message: unsupported_codex_app_message().to_string(),
             }
+        }
+        Some("patch") => {
+            let mut url: Option<String> = None;
+            let mut refresh = false;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--url" => {
+                        i += 1;
+                        if i < args.len() {
+                            url = Some(args[i].clone());
+                        }
+                    }
+                    "--refresh" => refresh = true,
+                    _ => {}
+                }
+                i += 1;
+            }
+            Invocation::Patch { url, refresh }
         }
         Some(first) => {
             if find_agent(config, first).is_some() {
@@ -475,6 +509,8 @@ cx {VERSION}
   cx
   cx <agent> [args...]
   cx probe [model-id]
+  cx patch --url <url>
+  cx patch --refresh
   cx --help
   cx --version
 
@@ -484,13 +520,16 @@ cx {VERSION}
   - 选择完成后，剩余参数会原样透传给最终原生 CLI。
   - `cx` 不代理 `codex app` 桌面端；如需桌面端请直接运行原生 `codex app ...`。
   - `probe` 用于探测模型对 completions / responses 的支持情况。
+  - `patch --url <url>` 从远程下载 Provider 配置并合并到本地。
+  - `patch --refresh` 使用上次记录的 URL 重新获取配置。
 
 示例：
   cx
   cx claude mcp list
   cx codex --approval-mode on-request
   cx probe
-  cx probe qwen3.6-plus"
+  cx probe qwen3.6-plus
+  cx patch --url https://example.com/cx-providers.yaml"
     );
 }
 
@@ -536,9 +575,207 @@ fn print_add_provider_guide(agent_id: &str) {
     println!();
 }
 
+// ══════════════════════════════════════════════════
+// Patch — 远程 Provider 配置合并
+// ══════════════════════════════════════════════════
+
+fn patch_source_path() -> Result<PathBuf> {
+    let home = home_dir().context("无法解析用户主目录")?;
+    Ok(home.join(".config/cx/.patch_source"))
+}
+
+fn save_patch_source(url: &str) -> Result<()> {
+    let path = patch_source_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
+    }
+    fs::write(&path, url).with_context(|| "保存 patch 来源 URL 失败")?;
+    Ok(())
+}
+
+fn load_patch_source() -> Result<String> {
+    let path = patch_source_path()?;
+    fs::read_to_string(&path)
+        .map(|s| s.trim().to_string())
+        .with_context(|| {
+            format!(
+                "未找到 patch 来源 URL，请先运行 `cx patch --url <url>`: {}",
+                path.display()
+            )
+        })
+}
+
+fn run_patch(invocation: &Invocation) -> Result<()> {
+    let (url, is_refresh) = match invocation {
+        Invocation::Patch { url, refresh } => (url.clone(), *refresh),
+        _ => bail!("内部错误: 非法的 patch 调用"),
+    };
+
+    let url = if is_refresh {
+        load_patch_source()?
+    } else if let Some(ref u) = url {
+        u.clone()
+    } else {
+        bail!("请指定 --url <url> 或 --refresh")
+    };
+
+    println!("从 {} 下载 Provider 配置...", url);
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("初始化 HTTP 客户端失败")?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .with_context(|| format!("下载配置失败: {url}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        bail!("下载配置失败: HTTP {}", status.as_u16());
+    }
+
+    let body = response.text().context("读取响应失败")?;
+    let incoming: CxConfig =
+        serde_yaml::from_str(&body).with_context(|| "解析远程配置失败")?;
+
+    // Load existing config (if any) or start fresh
+    let config_path = config_path()?;
+    let existing = if config_path.exists() {
+        let content = fs::read_to_string(&config_path)
+            .with_context(|| format!("读取配置文件失败: {}", config_path.display()))?;
+        serde_yaml::from_str::<CxConfig>(&content).unwrap_or_default()
+    } else {
+        CxConfig::default()
+    };
+
+    let merged = CxConfig {
+        providers: merge_providers(&existing.providers, &incoming.providers),
+        agents: merge_agents(&existing.agents, &incoming.agents),
+    };
+
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
+    }
+
+    let yaml = serde_yaml::to_string(&merged).context("序列化配置失败")?;
+    fs::write(&config_path, yaml)
+        .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
+
+    // Persist source URL for future --refresh
+    save_patch_source(&url)?;
+
+    println!("配置已更新: {}", config_path.display());
+    println!("来源 URL 已记录，后续可通过 `cx patch --refresh` 更新。");
+
+    Ok(())
+}
+
+/// Replace providers by `name`; new providers are appended.
+/// Preserves existing order; incoming replacements stay in-place, new items are appended at end.
+fn merge_providers(existing: &[ProviderConfig], incoming: &[ProviderConfig]) -> Vec<ProviderConfig> {
+    let incoming_names: Vec<&str> = incoming.iter().map(|p| p.name.as_str()).collect();
+    let mut result: Vec<ProviderConfig> = existing
+        .iter()
+        .filter(|p| !incoming_names.contains(&p.name.as_str()))
+        .cloned()
+        .collect();
+
+    for p in incoming {
+        result.push(p.clone());
+    }
+
+    result
+}
+
+/// Replace agents by `id`; new agents are appended.
+/// Preserves existing order; incoming replacements stay in-place, new items are appended at end.
+fn merge_agents(existing: &[AgentConfig], incoming: &[AgentConfig]) -> Vec<AgentConfig> {
+    let incoming_ids: Vec<&str> = incoming.iter().map(|a| a.id.as_str()).collect();
+    let mut result: Vec<AgentConfig> = existing
+        .iter()
+        .filter(|a| !incoming_ids.contains(&a.id.as_str()))
+        .cloned()
+        .collect();
+
+    for a in incoming {
+        result.push(a.clone());
+    }
+
+    result
+}
+
+// ══════════════════════════════════════════════════
+// Secret Prompting — 交互式补齐缺失的 API Key
+// ══════════════════════════════════════════════════
+
+/// Attempt to resolve apikey; if the backend supports interactive entry (keychain),
+/// prompt the user instead of failing.
+fn resolve_apikey_interactive(source: &str) -> Result<String> {
+    match resolve_apikey(source) {
+        Ok(key) => Ok(key),
+        Err(e) => {
+            if let Some(service) = source.strip_prefix("keychain:") {
+                eprintln!("从 Keychain 读取 `{service}` 失败: {e}");
+                eprint!("请输入 {service} 的 API Key: ");
+
+                let mut input = String::new();
+                io::stdin()
+                    .read_line(&mut input)
+                    .context("读取输入失败")?;
+                let key = input.trim().to_string();
+
+                if key.is_empty() {
+                    bail!("API Key 不能为空");
+                }
+
+                // Store to keychain
+                let user = env::var("USER").unwrap_or_default();
+                let child = Command::new("security")
+                    .args([
+                        "add-generic-password",
+                        "-a",
+                        &user,
+                        "-s",
+                        service,
+                        "-w",
+                        &key,
+                        "-U",
+                    ])
+                    .spawn()
+                    .with_context(|| "写入 Keychain 失败")?;
+
+                let output = child
+                    .wait_with_output()
+                    .with_context(|| "等待 Keychain 写入完成失败")?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    bail!("写入 Keychain 失败: {}", stderr.trim());
+                }
+
+                eprintln!("已将 API Key 保存到 Keychain `{service}`。");
+                Ok(key)
+            } else if let Some(var) = source.strip_prefix("env:") {
+                bail!(
+                    "环境变量 `{var}` 未设置，请通过 `export {var}=<your-key>` 设置后重试"
+                )
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 fn exec_launch(spec: LaunchSpec) -> Result<()> {
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
+    for name in &spec.env_remove {
+        command.env_remove(name);
+    }
     command.envs(&spec.env);
 
     if spec.detach {
@@ -584,6 +821,7 @@ struct LaunchSpec {
     env: BTreeMap<String, String>,
     summary: String,
     detach: bool,
+    env_remove: Vec<String>,
 }
 
 fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Result<LaunchSpec> {
@@ -593,6 +831,7 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
 
     let agent_id = &selection.agent_id;
     let provider = &selection.provider;
+    let mut env_remove = Vec::new();
 
     // Default provider (no endpoints) — use agent's own default behavior
     if !provider.has_endpoints {
@@ -601,8 +840,10 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
                 args.extend(passthrough_args.iter().cloned());
             }
             "claude" => {
+                env_remove.push("ANTHROPIC_API_KEY".into());
+                env_remove.push("ANTHROPIC_AUTH_TOKEN".into());
                 if let Some(ref source) = provider.apikey_source {
-                    let key = resolve_apikey(source)?;
+                    let key = resolve_apikey_interactive(source)?;
                     env.insert("ANTHROPIC_API_KEY".into(), key.clone());
                     env.insert("ANTHROPIC_AUTH_TOKEN".into(), key);
                 }
@@ -610,7 +851,7 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
             }
             "codex" => {
                 if let Some(ref source) = provider.apikey_source {
-                    if let Ok(value) = resolve_apikey(source) {
+                    if let Ok(value) = resolve_apikey_interactive(source) {
                         env.insert("AZURE_OPENAI_API_KEY".into(), value);
                     }
                 }
@@ -628,7 +869,7 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
         ))?;
 
         let apikey = if let Some(ref source) = provider.apikey_source {
-            resolve_apikey(source)?
+            resolve_apikey_interactive(source)?
         } else {
             bail!(
                 "Provider `{}` 需要 API Key 但未配置 apikey_source",
@@ -652,6 +893,8 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
                 args.extend(passthrough_args.iter().cloned());
             }
             "claude" => {
+                env_remove.push("ANTHROPIC_API_KEY".into());
+                env_remove.push("ANTHROPIC_AUTH_TOKEN".into());
                 env.insert("ANTHROPIC_BASE_URL".into(), model.endpoint_url.clone());
                 env.insert("ANTHROPIC_API_KEY".into(), apikey);
                 env.insert("ANTHROPIC_MODEL".into(), model.id.clone());
@@ -688,6 +931,7 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
         env,
         summary,
         detach: false,
+        env_remove,
     })
 }
 
@@ -785,7 +1029,7 @@ fn run_probe(target_model: Option<String>, config: &CxConfig) -> Result<()> {
         .find(|p| !p.endpoints.is_empty() && p.apikey_source.is_some())
         .context("没有可探测的 Provider（需要至少一个有 endpoint 和 apikey_source 的 Provider）")?;
 
-    let apikey = resolve_apikey(probe_provider.apikey_source.as_ref().unwrap())?;
+    let apikey = resolve_apikey_interactive(probe_provider.apikey_source.as_ref().unwrap())?;
 
     // Use the first endpoint's URL as the probe base URL
     let probe_base_url = &probe_provider.endpoints[0].url;
@@ -1563,5 +1807,153 @@ mod tests {
     fn resolve_binary_finds_codex_cli() {
         let path = resolve_binary("codex").unwrap();
         assert!(path.ends_with("codex"));
+    }
+
+    // ── Patch / merge tests ──
+
+    #[test]
+    fn merge_providers_replaces_by_name() {
+        let existing = vec![ProviderConfig {
+            name: "A".into(),
+            apikey_source: Some("literal:old".into()),
+            agents: vec![],
+            endpoints: vec![],
+        }];
+        let incoming = vec![ProviderConfig {
+            name: "A".into(),
+            apikey_source: Some("literal:new".into()),
+            agents: vec![],
+            endpoints: vec![],
+        }];
+        let merged = merge_providers(&existing, &incoming);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].apikey_source.as_deref(), Some("literal:new"));
+    }
+
+    #[test]
+    fn merge_providers_appends_new() {
+        let existing = vec![ProviderConfig {
+            name: "A".into(),
+            apikey_source: None,
+            agents: vec![],
+            endpoints: vec![],
+        }];
+        let incoming = vec![ProviderConfig {
+            name: "B".into(),
+            apikey_source: None,
+            agents: vec![],
+            endpoints: vec![],
+        }];
+        let merged = merge_providers(&existing, &incoming);
+        assert_eq!(merged.len(), 2);
+        let names: Vec<&str> = merged.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"A"));
+        assert!(names.contains(&"B"));
+    }
+
+    #[test]
+    fn merge_agents_replaces_by_id() {
+        let existing = vec![AgentConfig {
+            id: "claude".into(),
+            binary: "claude-old".into(),
+        }];
+        let incoming = vec![AgentConfig {
+            id: "claude".into(),
+            binary: "claude-new".into(),
+        }];
+        let merged = merge_agents(&existing, &incoming);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].binary, "claude-new");
+    }
+
+    #[test]
+    fn merge_agents_appends_new() {
+        let existing = vec![AgentConfig {
+            id: "copilot".into(),
+            binary: "copilot".into(),
+        }];
+        let incoming = vec![AgentConfig {
+            id: "codex".into(),
+            binary: "codex".into(),
+        }];
+        let merged = merge_agents(&existing, &incoming);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn parse_patch_url() {
+        let config = CxConfig::default();
+        assert_eq!(
+            parse_invocation(
+                vec!["patch".into(), "--url".into(), "https://example.com/p.yaml".into()],
+                &config
+            ),
+            Invocation::Patch {
+                url: Some("https://example.com/p.yaml".into()),
+                refresh: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_patch_refresh() {
+        let config = CxConfig::default();
+        assert_eq!(
+            parse_invocation(vec!["patch".into(), "--refresh".into()], &config),
+            Invocation::Patch {
+                url: None,
+                refresh: true,
+            }
+        );
+    }
+
+    #[test]
+    fn claude_launch_spec_removes_anthropic_env_vars() {
+        let selection = Selection {
+            agent_id: "claude".into(),
+            agent_binary: "claude".into(),
+            provider: ResolvedProvider {
+                name: "Test".into(),
+                has_endpoints: false,
+                apikey_source: Some("literal:test-key".into()),
+            },
+            model: None,
+        };
+        let spec = build_launch_spec(&selection, &[]).unwrap();
+        assert!(spec.env_remove.contains(&"ANTHROPIC_API_KEY".to_string()));
+        assert!(spec
+            .env_remove
+            .contains(&"ANTHROPIC_AUTH_TOKEN".to_string()));
+        assert_eq!(spec.env.get("ANTHROPIC_API_KEY").map(String::as_str), Some("test-key"));
+    }
+
+    #[test]
+    fn claude_with_endpoint_removes_anthropic_env_vars() {
+        let selection = Selection {
+            agent_id: "claude".into(),
+            agent_binary: "claude".into(),
+            provider: ResolvedProvider {
+                name: "DashScope".into(),
+                has_endpoints: true,
+                apikey_source: Some("literal:test-key".into()),
+            },
+            model: Some(ResolvedModel {
+                id: "qwen3.6-plus".into(),
+                arena: "—".into(),
+                swe_p: "—".into(),
+                tb2: "—".into(),
+                desc: String::new(),
+                wire_api: WireApi::Anthropic,
+                provider_name: "DashScope".into(),
+                endpoint_url: "https://dashscope.aliyuncs.com/apps/anthropic".into(),
+                visible_agents: vec!["claude".into()],
+            }),
+        };
+        let spec = build_launch_spec(&selection, &[]).unwrap();
+        assert!(spec.env_remove.contains(&"ANTHROPIC_API_KEY".to_string()));
+        assert!(spec
+            .env_remove
+            .contains(&"ANTHROPIC_AUTH_TOKEN".to_string()));
+        assert_eq!(spec.env.get("ANTHROPIC_BASE_URL").map(String::as_str), Some("https://dashscope.aliyuncs.com/apps/anthropic"));
     }
 }
