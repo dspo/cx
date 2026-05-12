@@ -1,10 +1,10 @@
-# Internal edition embedded configuration template.
-# The build embeds this file into the binary and substitutes CI variables
-# such as ${CX_DASHSCOPE_API_KEY} before compilation.
+# Default provider configuration baseline for cx.
+# Patch or copy this into ~/.config/cx/cx.providers.config.yaml and adjust
+# apikey_source to match your local secret backend if needed.
 
 providers:
   - name: 百炼
-    apikey_source: 'literal:${CX_DASHSCOPE_API_KEY}'
+    apikey_source: "keychain:DASHSCOPE_API_KEY"
     endpoints:
       anthropic:
         url: https://dashscope.aliyuncs.com/apps/anthropic
@@ -114,7 +114,7 @@ providers:
     agents: [copilot]
 
   - name: Packy API
-    apikey_source: 'literal:${CX_ANTHROPIC_API_KEY}'
+    apikey_source: "keychain:ANTHROPIC_API_KEY"
     endpoints:
       anthropic:
         url: https://www.packyapi.com/
@@ -125,7 +125,7 @@ providers:
         desc: "Claude Opus 4.7"
 
   - name: Xiaomi MIMO (陈忠润)
-    apikey_source: 'literal:${CX_MIMO_API_KEY}'
+    apikey_source: "keychain:MIMO_API_KEY"
     endpoints:
       anthropic:
         url: https://token-plan-cn.xiaomimimo.com/anthropic

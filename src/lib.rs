@@ -22,12 +22,14 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const PROVIDER_CONFIG_FILE_NAME: &str = "cx.providers.config.yaml";
+const LEGACY_PROVIDER_CONFIG_FILE_NAME: &str = "config.yaml";
 
 mod embedded {
     include!(concat!(env!("OUT_DIR"), "/embedded_config.rs"));
@@ -486,24 +488,85 @@ fn unsupported_codex_app_message() -> &'static str {
 // 配置加载
 // ══════════════════════════════════════════════════
 
-fn config_path() -> Result<PathBuf> {
-    let home = home_dir().context("无法解析用户主目录")?;
-    Ok(home.join(".config/cx/config.yaml"))
+fn provider_config_path() -> Result<PathBuf> {
+    Ok(cx_state_dir()?.join(PROVIDER_CONFIG_FILE_NAME))
+}
+
+fn legacy_provider_config_path() -> Result<PathBuf> {
+    Ok(cx_state_dir()?.join(LEGACY_PROVIDER_CONFIG_FILE_NAME))
+}
+
+fn migrate_legacy_provider_config(current_path: &Path, legacy_path: &Path) -> Result<bool> {
+    if current_path.exists() || !legacy_path.exists() {
+        return Ok(false);
+    }
+
+    if let Some(parent) = current_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
+    }
+
+    fs::rename(legacy_path, current_path).with_context(|| {
+        format!(
+            "迁移旧配置失败: {} -> {}",
+            legacy_path.display(),
+            current_path.display()
+        )
+    })?;
+    eprintln!("已将旧 Provider 配置迁移到 {}", current_path.display());
+    Ok(true)
+}
+
+fn active_provider_config_path() -> Result<PathBuf> {
+    let current_path = provider_config_path()?;
+    let legacy_path = legacy_provider_config_path()?;
+    migrate_legacy_provider_config(&current_path, &legacy_path)?;
+    Ok(current_path)
+}
+
+fn read_config_file(path: &Path) -> Result<CxConfig> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("读取配置文件失败: {}", path.display()))?;
+    serde_yaml::from_str(&content).with_context(|| format!("解析配置文件失败: {}", path.display()))
+}
+
+fn write_string_atomic(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(PROVIDER_CONFIG_FILE_NAME);
+    let tmp_path = path.with_file_name(format!(".{file_name}.{}.tmp", random_urlsafe(6)));
+    fs::write(&tmp_path, content)
+        .with_context(|| format!("写入临时配置文件失败: {}", tmp_path.display()))?;
+
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| {
+            format!(
+                "替换配置文件失败: {} -> {}",
+                tmp_path.display(),
+                path.display()
+            )
+        });
+    }
+
+    Ok(())
 }
 
 fn load_config() -> Result<CxConfig> {
-    let path = config_path()?;
+    let path = active_provider_config_path()?;
     if !path.exists() {
         bail!(
-            "配置文件不存在: {}\n请参考 docs/cx-config-schema.yaml 创建配置文件，或运行 `cx patch --url <url>` 导入。",
+            "Provider 配置不存在: {}\n请先运行 `cx patch --url <url>` 导入，或手动创建该 YAML 文件。",
             path.display()
         );
     }
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("读取配置文件失败: {}", path.display()))?;
-    let config: CxConfig = serde_yaml::from_str(&content)
-        .with_context(|| format!("解析配置文件失败: {}", path.display()))?;
-    Ok(config)
+    read_config_file(&path)
 }
 
 fn resolve_apikey(source: &str) -> Result<String> {
@@ -1115,17 +1178,12 @@ pub fn run() -> Result<()> {
 
             if let Some(first) = args.first() {
                 if first == "codex-app"
-                    || (first == "codex"
-                        && args.get(1).map(String::as_str) == Some("app"))
+                    || (first == "codex" && args.get(1).map(String::as_str) == Some("app"))
                 {
                     bail!(unsupported_codex_app_message());
                 }
                 if let Some(agent) = find_agent(&config, first) {
-                    return run_launcher(
-                        Some(agent.id),
-                        &config,
-                        args[1..].to_vec(),
-                    );
+                    return run_launcher(Some(agent.id), &config, args[1..].to_vec());
                 }
             }
 
@@ -1171,8 +1229,9 @@ fn print_add_provider_guide(agent_id: &str) {
     println!("为 {agent_id} 添加 Provider：");
     println!();
     println!("1. 运行 `cx patch --url <url>` 从远程下载 Provider 配置。");
-    println!("2. 或手动编辑 ~/.config/cx/config.yaml 的 providers 列表。");
-    println!("3. 配置格式参考: docs/cx-config-schema.yaml");
+    println!("2. 或手动编辑 ~/.config/cx/cx.providers.config.yaml 的 providers 列表。");
+    println!("3. 仓库中的 `config/providers.default.yaml` 可作为基线示例。");
+    println!("4. 配置格式参考: docs/cx-config-schema.yaml");
     println!();
 }
 
@@ -1238,14 +1297,11 @@ fn run_patch(url: Option<String>, refresh: bool) -> Result<()> {
     }
 
     let body = response.text().context("读取响应失败")?;
-    let incoming: CxConfig =
-        serde_yaml::from_str(&body).with_context(|| "解析远程配置失败")?;
+    let incoming: CxConfig = serde_yaml::from_str(&body).with_context(|| "解析远程配置失败")?;
 
-    let config_path = config_path()?;
+    let config_path = active_provider_config_path()?;
     let existing = if config_path.exists() {
-        let content = fs::read_to_string(&config_path)
-            .with_context(|| format!("读取配置文件失败: {}", config_path.display()))?;
-        serde_yaml::from_str::<CxConfig>(&content).unwrap_or_default()
+        read_config_file(&config_path)?
     } else {
         CxConfig::default()
     };
@@ -1255,14 +1311,8 @@ fn run_patch(url: Option<String>, refresh: bool) -> Result<()> {
         agents: merge_agents(&existing.agents, &incoming.agents),
     };
 
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
-    }
-
     let yaml = serde_yaml::to_string(&merged).context("序列化配置失败")?;
-    fs::write(&config_path, yaml)
-        .with_context(|| format!("写入配置文件失败: {}", config_path.display()))?;
+    write_string_atomic(&config_path, &yaml)?;
 
     save_patch_source(&url)?;
 
@@ -1274,16 +1324,30 @@ fn run_patch(url: Option<String>, refresh: bool) -> Result<()> {
 
 /// Replace providers by `name`; new providers are appended.
 /// Preserves existing order; incoming replacements stay in-place, new items are appended at end.
-fn merge_providers(existing: &[ProviderConfig], incoming: &[ProviderConfig]) -> Vec<ProviderConfig> {
-    let incoming_names: Vec<&str> = incoming.iter().map(|p| p.name.as_str()).collect();
-    let mut result: Vec<ProviderConfig> = existing
-        .iter()
-        .filter(|p| !incoming_names.contains(&p.name.as_str()))
-        .cloned()
-        .collect();
+fn merge_providers(
+    existing: &[ProviderConfig],
+    incoming: &[ProviderConfig],
+) -> Vec<ProviderConfig> {
+    let mut replaced = vec![false; incoming.len()];
+    let mut result = Vec::with_capacity(existing.len() + incoming.len());
 
-    for p in incoming {
-        result.push(p.clone());
+    for existing_provider in existing {
+        if let Some((index, replacement)) = incoming
+            .iter()
+            .enumerate()
+            .find(|(_, provider)| provider.name == existing_provider.name)
+        {
+            replaced[index] = true;
+            result.push(replacement.clone());
+        } else {
+            result.push(existing_provider.clone());
+        }
+    }
+
+    for (index, provider) in incoming.iter().enumerate() {
+        if !replaced[index] {
+            result.push(provider.clone());
+        }
     }
 
     result
@@ -1292,15 +1356,26 @@ fn merge_providers(existing: &[ProviderConfig], incoming: &[ProviderConfig]) -> 
 /// Replace agents by `id`; new agents are appended.
 /// Preserves existing order; incoming replacements stay in-place, new items are appended at end.
 fn merge_agents(existing: &[AgentConfig], incoming: &[AgentConfig]) -> Vec<AgentConfig> {
-    let incoming_ids: Vec<&str> = incoming.iter().map(|a| a.id.as_str()).collect();
-    let mut result: Vec<AgentConfig> = existing
-        .iter()
-        .filter(|a| !incoming_ids.contains(&a.id.as_str()))
-        .cloned()
-        .collect();
+    let mut replaced = vec![false; incoming.len()];
+    let mut result = Vec::with_capacity(existing.len() + incoming.len());
 
-    for a in incoming {
-        result.push(a.clone());
+    for existing_agent in existing {
+        if let Some((index, replacement)) = incoming
+            .iter()
+            .enumerate()
+            .find(|(_, agent)| agent.id == existing_agent.id)
+        {
+            replaced[index] = true;
+            result.push(replacement.clone());
+        } else {
+            result.push(existing_agent.clone());
+        }
+    }
+
+    for (index, agent) in incoming.iter().enumerate() {
+        if !replaced[index] {
+            result.push(agent.clone());
+        }
     }
 
     result
@@ -1315,13 +1390,14 @@ fn resolve_apikey_interactive(source: &str) -> Result<String> {
         Ok(key) => Ok(key),
         Err(e) => {
             if let Some(service) = source.strip_prefix("keychain:") {
+                if !cfg!(target_os = "macos") {
+                    bail!("`keychain:` 仅支持 macOS Keychain，请改用 `env:` 或在 macOS 上运行。");
+                }
                 eprintln!("从 Keychain 读取 `{service}` 失败: {e}");
                 eprint!("请输入 {service} 的 API Key: ");
 
                 let mut input = String::new();
-                io::stdin()
-                    .read_line(&mut input)
-                    .context("读取输入失败")?;
+                io::stdin().read_line(&mut input).context("读取输入失败")?;
                 let key = input.trim().to_string();
 
                 if key.is_empty() {
@@ -1355,9 +1431,7 @@ fn resolve_apikey_interactive(source: &str) -> Result<String> {
                 eprintln!("已将 API Key 保存到 Keychain `{service}`。");
                 Ok(key)
             } else if let Some(var) = source.strip_prefix("env:") {
-                bail!(
-                    "环境变量 `{var}` 未设置，请通过 `export {var}=<your-key>` 设置后重试"
-                )
+                bail!("环境变量 `{var}` 未设置，请通过 `export {var}=<your-key>` 设置后重试")
             } else {
                 Err(e)
             }
@@ -1596,6 +1670,10 @@ fn resolve_binary(name: &str) -> Result<PathBuf> {
 }
 
 fn keychain_secret(service: &str) -> Result<String> {
+    if !cfg!(target_os = "macos") {
+        bail!("`keychain:` 仅支持 macOS Keychain，请改用 `env:` 配置 `{service}`。");
+    }
+
     let user = env::var("USER").unwrap_or_default();
     let output = Command::new("security")
         .args(["find-generic-password", "-a", &user, "-s", service, "-w"])
@@ -2226,7 +2304,6 @@ fn current_prompt(state: &AppState) -> String {
 // Tests
 // ══════════════════════════════════════════════════
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2258,6 +2335,10 @@ mod tests {
                 },
             ],
         }
+    }
+
+    fn temp_test_dir(label: &str) -> PathBuf {
+        env::temp_dir().join(format!("cx-{label}-{}", random_urlsafe(6)))
     }
 
     // ── clap CLI parsing tests ──
@@ -2364,7 +2445,10 @@ mod tests {
         };
         let spec = build_launch_spec(&selection, &[]).unwrap();
         assert!(spec.env_remove.contains(&"ANTHROPIC_API_KEY".to_string()));
-        assert!(spec.env_remove.contains(&"ANTHROPIC_AUTH_TOKEN".to_string()));
+        assert!(
+            spec.env_remove
+                .contains(&"ANTHROPIC_AUTH_TOKEN".to_string())
+        );
         assert_eq!(
             spec.env.get("ANTHROPIC_API_KEY").map(String::as_str),
             Some("test-key")
@@ -2396,7 +2480,10 @@ mod tests {
         };
         let spec = build_launch_spec(&selection, &[]).unwrap();
         assert!(spec.env_remove.contains(&"ANTHROPIC_API_KEY".to_string()));
-        assert!(spec.env_remove.contains(&"ANTHROPIC_AUTH_TOKEN".to_string()));
+        assert!(
+            spec.env_remove
+                .contains(&"ANTHROPIC_AUTH_TOKEN".to_string())
+        );
         assert_eq!(
             spec.env.get("ANTHROPIC_BASE_URL").map(String::as_str),
             Some("https://dashscope.aliyuncs.com/apps/anthropic")
@@ -2447,6 +2534,57 @@ mod tests {
     }
 
     #[test]
+    fn merge_providers_preserves_order_for_replacements() {
+        let existing = vec![
+            ProviderConfig {
+                name: "A".into(),
+                apikey_source: Some("literal:a".into()),
+                agents: vec![],
+                models: BTreeMap::new(),
+                endpoints: BTreeMap::new(),
+            },
+            ProviderConfig {
+                name: "B".into(),
+                apikey_source: Some("literal:old".into()),
+                agents: vec![],
+                models: BTreeMap::new(),
+                endpoints: BTreeMap::new(),
+            },
+            ProviderConfig {
+                name: "C".into(),
+                apikey_source: Some("literal:c".into()),
+                agents: vec![],
+                models: BTreeMap::new(),
+                endpoints: BTreeMap::new(),
+            },
+        ];
+        let incoming = vec![
+            ProviderConfig {
+                name: "B".into(),
+                apikey_source: Some("literal:new".into()),
+                agents: vec![],
+                models: BTreeMap::new(),
+                endpoints: BTreeMap::new(),
+            },
+            ProviderConfig {
+                name: "D".into(),
+                apikey_source: Some("literal:d".into()),
+                agents: vec![],
+                models: BTreeMap::new(),
+                endpoints: BTreeMap::new(),
+            },
+        ];
+
+        let merged = merge_providers(&existing, &incoming);
+        let names: Vec<&str> = merged
+            .iter()
+            .map(|provider| provider.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["A", "B", "C", "D"]);
+        assert_eq!(merged[1].apikey_source.as_deref(), Some("literal:new"));
+    }
+
+    #[test]
     fn merge_agents_replaces_by_id() {
         let existing = vec![AgentConfig {
             id: "claude".into(),
@@ -2477,6 +2615,62 @@ mod tests {
         }];
         let merged = merge_agents(&existing, &incoming);
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_agents_preserves_order_for_replacements() {
+        let existing = vec![
+            AgentConfig {
+                id: "copilot".into(),
+                binary: "copilot".into(),
+                wire_apis: vec![],
+            },
+            AgentConfig {
+                id: "claude".into(),
+                binary: "claude-old".into(),
+                wire_apis: vec![],
+            },
+            AgentConfig {
+                id: "codex".into(),
+                binary: "codex".into(),
+                wire_apis: vec![],
+            },
+        ];
+        let incoming = vec![
+            AgentConfig {
+                id: "claude".into(),
+                binary: "claude-new".into(),
+                wire_apis: vec![],
+            },
+            AgentConfig {
+                id: "gemini".into(),
+                binary: "gemini".into(),
+                wire_apis: vec![],
+            },
+        ];
+
+        let merged = merge_agents(&existing, &incoming);
+        let ids: Vec<&str> = merged.iter().map(|agent| agent.id.as_str()).collect();
+        assert_eq!(ids, vec!["copilot", "claude", "codex", "gemini"]);
+        assert_eq!(merged[1].binary, "claude-new");
+    }
+
+    #[test]
+    fn migrate_legacy_provider_config_moves_file() {
+        let dir = temp_test_dir("provider-config-migration");
+        fs::create_dir_all(&dir).unwrap();
+
+        let current_path = dir.join(PROVIDER_CONFIG_FILE_NAME);
+        let legacy_path = dir.join(LEGACY_PROVIDER_CONFIG_FILE_NAME);
+        let content = "providers: []\nagents: []\n";
+        fs::write(&legacy_path, content).unwrap();
+
+        let migrated = migrate_legacy_provider_config(&current_path, &legacy_path).unwrap();
+        assert!(migrated);
+        assert!(!legacy_path.exists());
+        assert_eq!(fs::read_to_string(&current_path).unwrap(), content);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

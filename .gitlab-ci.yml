@@ -27,10 +27,6 @@ build:linux-x86_64:
   stage: build
   image: rust:1.85
   script:
-    - |
-      if [ -n "${CI_COMMIT_TAG:-}" ]; then
-        export CX_ENFORCE_EMBEDDED_SECRETS=1
-      fi
     - cargo build --release
     - mkdir -p dist
     - cp target/release/cx dist/cx-linux-x86_64
@@ -51,10 +47,6 @@ build:darwin-arm64:
     - cargo install --locked cargo-zigbuild
     - rustup target add aarch64-apple-darwin
   script:
-    - |
-      if [ -n "${CI_COMMIT_TAG:-}" ]; then
-        export CX_ENFORCE_EMBEDDED_SECRETS=1
-      fi
     - cargo zigbuild --release --target aarch64-apple-darwin
     - mkdir -p dist
     - cp target/aarch64-apple-darwin/release/cx dist/cx-darwin-arm64

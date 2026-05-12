@@ -3,7 +3,7 @@
 `cx` internal edition is a Rust TUI launcher for `copilot`, `claude`, and `codex`.
 This edition is designed for GitLab-hosted internal distribution:
 
-- provider/model config is embedded at build time
+- provider/model config lives in runtime YAML files
 - normal usage is gated by GitLab login
 - GitLab CI builds and publishes release assets
 - GitLab Release install script is the primary installation path
@@ -57,42 +57,35 @@ export CX_GITLAB_TOKEN=<gitlab-personal-access-token>
 npx @awesome/cx login
 ```
 
-## Build-time embedded config
+## Runtime provider config
 
-The internal edition no longer reads `~/.config/cx/config.yaml` at runtime.
-Instead, `build.rs` embeds `config/internal.config.yaml` into the binary and
-substitutes these CI variables if present:
+`cx` reads provider/model config from `~/.config/cx/cx.providers.config.yaml`
+at runtime. If an older `~/.config/cx/config.yaml` exists, it is migrated to the
+new path automatically on first use.
 
-- `CX_DASHSCOPE_API_KEY`
-- `CX_ANTHROPIC_API_KEY`
-- `CX_MIMO_API_KEY`
+The repo keeps `config/providers.default.yaml` as the published baseline
+reference. Typical workflows:
 
-Optional embedded GitLab settings:
+```bash
+cx patch --url <url>
+cx patch --refresh
+```
+
+Or edit `~/.config/cx/cx.providers.config.yaml` directly.
+
+When a provider uses `apikey_source: keychain:<SERVICE>` and that secret is
+missing, `cx` prompts on first real use and writes it back to Keychain. `env:`
+sources are resolved strictly from the environment and are not rewritten.
+
+GitLab OAuth settings remain build-time embedded and can be overridden with:
 
 - `CX_GITLAB_BASE_URL`
 - `CX_GITLAB_CLIENT_ID`
 - `CX_GITLAB_CALLBACK_URL`
 - `CX_GITLAB_SCOPES`
 
-For release builds, CI automatically enables `CX_ENFORCE_EMBEDDED_SECRETS=1`
-on tag pipelines.
-
-If the secret variables are absent in local development, the build falls back to
-macOS Keychain first and then to placeholder values so `cargo test` still works.
-By default, local builds look for Keychain services named:
-
-- `DASHSCOPE_API_KEY`
-- `ANTHROPIC_API_KEY`
-- `MIMO_API_KEY`
-
-If needed, you can override the service names with:
-
-- `CX_DASHSCOPE_API_KEY_KEYCHAIN_SERVICE`
-- `CX_ANTHROPIC_API_KEY_KEYCHAIN_SERVICE`
-- `CX_MIMO_API_KEY_KEYCHAIN_SERVICE`
-
 For `codex`, only models verified to work through the injected DashScope
-responses provider are exposed in the embedded config.
+responses provider are exposed in the published baseline config.
 
 ## GitLab CI delivery
 
