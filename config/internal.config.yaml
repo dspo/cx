@@ -62,6 +62,7 @@ providers:
         wire_apis: [responses]
       deepseek-v4-pro[1m]:
         wire_apis: [anthropic, completions]
+        agents: [claude]
       glm-5.1:
         arena: "#"
         swe_p: "—"

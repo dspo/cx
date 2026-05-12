@@ -2300,6 +2300,17 @@ mod tests {
     }
 
     #[test]
+    fn copilot_dashscope_hides_deepseek_v4_pro_1m() {
+        let config = test_config();
+        let all_models = build_all_models(&config);
+        let models = models_for_provider(&all_models, "copilot", "百炼");
+        assert!(
+            models.iter().all(|model| model.id != "deepseek-v4-pro[1m]"),
+            "copilot should not offer deepseek-v4-pro[1m] on DashScope"
+        );
+    }
+
+    #[test]
     fn copilot_packy_provider_is_visible() {
         let config = test_config();
         let providers = providers_for_agent(&config, "copilot");

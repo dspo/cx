@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 const CONFIG_TEMPLATE_PATH: &str = "config/internal.config.yaml";
 const DEFAULT_GITLAB_BASE_URL: &str = "https://git.huayi.tech";
@@ -10,10 +11,28 @@ const DEFAULT_GITLAB_CLIENT_ID: &str =
 const DEFAULT_GITLAB_CALLBACK_URL: &str = "http://127.0.0.1:38081/callback";
 const DEFAULT_GITLAB_SCOPES: &str = "read_user openid profile email";
 
-const TEMPLATE_VARS: [(&str, &str); 3] = [
-    ("CX_DASHSCOPE_API_KEY", "dev-dashscope-key"),
-    ("CX_ANTHROPIC_API_KEY", "dev-anthropic-key"),
-    ("CX_MIMO_API_KEY", "dev-mimo-api-key"),
+struct TemplateVar {
+    key: &'static str,
+    default: &'static str,
+    keychain_name: &'static str,
+}
+
+const TEMPLATE_VARS: [TemplateVar; 3] = [
+    TemplateVar {
+        key: "CX_DASHSCOPE_API_KEY",
+        default: "dev-dashscope-key",
+        keychain_name: "DASHSCOPE_API_KEY",
+    },
+    TemplateVar {
+        key: "CX_ANTHROPIC_API_KEY",
+        default: "dev-anthropic-key",
+        keychain_name: "ANTHROPIC_API_KEY",
+    },
+    TemplateVar {
+        key: "CX_MIMO_API_KEY",
+        default: "dev-mimo-api-key",
+        keychain_name: "MIMO_API_KEY",
+    },
 ];
 
 fn main() {
@@ -26,15 +45,20 @@ fn main() {
 
     let mut template_vars = BTreeMap::new();
     let mut missing = Vec::new();
-    for (key, default) in TEMPLATE_VARS {
-        println!("cargo:rerun-if-env-changed={key}");
-        match env::var(key) {
+    for spec in TEMPLATE_VARS {
+        println!("cargo:rerun-if-env-changed={}", spec.key);
+        println!(
+            "cargo:rerun-if-env-changed={}",
+            keychain_service_env_name(spec.key)
+        );
+        match resolve_template_var(&spec) {
             Ok(value) => {
-                template_vars.insert(key, yaml_single_quote_escape(&value));
+                template_vars.insert(spec.key, yaml_single_quote_escape(&value));
             }
-            Err(_) => {
-                template_vars.insert(key, yaml_single_quote_escape(default));
-                missing.push(key);
+            Err(err) => {
+                println!("cargo:warning={err}");
+                template_vars.insert(spec.key, yaml_single_quote_escape(spec.default));
+                missing.push(spec.key);
             }
         }
     }
@@ -90,6 +114,63 @@ fn render_template(template: &str, values: &BTreeMap<&str, String>) -> String {
 
 fn yaml_single_quote_escape(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+fn resolve_template_var(spec: &TemplateVar) -> Result<String, String> {
+    if let Ok(value) = env::var(spec.key) {
+        return Ok(value);
+    }
+
+    if cfg!(target_os = "macos") {
+        let service_env = keychain_service_env_name(spec.key);
+        let service = env::var(&service_env).unwrap_or_else(|_| spec.keychain_name.to_string());
+        match keychain_secret_by_service(&service) {
+            Ok(value) => return Ok(value),
+            Err(service_err) => {
+                return Err(format!(
+                    "using development placeholder for {} after missing env and Keychain service {}: {}",
+                    spec.key, service, service_err
+                ));
+            }
+        }
+    }
+
+    Err(format!(
+        "using development placeholder for {} because it is not set in the environment",
+        spec.key
+    ))
+}
+
+fn keychain_service_env_name(key: &str) -> String {
+    format!("{key}_KEYCHAIN_SERVICE")
+}
+
+fn keychain_secret_by_service(service: &str) -> Result<String, String> {
+    let user = env::var("USER").unwrap_or_default();
+    let output = Command::new("security")
+        .args(["find-generic-password", "-a", &user, "-s", service, "-w"])
+        .output()
+        .map_err(|err| format!("failed to run `security` for Keychain service {service}: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "unknown error".to_string()
+        } else {
+            stderr
+        });
+    }
+
+    let secret = String::from_utf8(output.stdout)
+        .map_err(|err| format!("Keychain service {service} returned non-UTF-8 data: {err}"))?
+        .trim()
+        .to_string();
+
+    if secret.is_empty() {
+        return Err("empty secret".to_string());
+    }
+
+    Ok(secret)
 }
 
 fn env_flag(key: &str) -> bool {

@@ -74,13 +74,22 @@ Optional embedded GitLab settings:
 - `CX_GITLAB_CALLBACK_URL`
 - `CX_GITLAB_SCOPES`
 
-For release builds, CI should set:
-
-- `CX_ENFORCE_EMBEDDED_SECRETS=1`
-- `GITLAB_RELEASE_TOKEN` (GitLab token with API scope for creating releases)
+For release builds, CI automatically enables `CX_ENFORCE_EMBEDDED_SECRETS=1`
+on tag pipelines.
 
 If the secret variables are absent in local development, the build falls back to
-placeholder values so `cargo test` still works.
+macOS Keychain first and then to placeholder values so `cargo test` still works.
+By default, local builds look for Keychain services named:
+
+- `DASHSCOPE_API_KEY`
+- `ANTHROPIC_API_KEY`
+- `MIMO_API_KEY`
+
+If needed, you can override the service names with:
+
+- `CX_DASHSCOPE_API_KEY_KEYCHAIN_SERVICE`
+- `CX_ANTHROPIC_API_KEY_KEYCHAIN_SERVICE`
+- `CX_MIMO_API_KEY_KEYCHAIN_SERVICE`
 
 For `codex`, only models verified to work through the injected DashScope
 responses provider are exposed in the embedded config.
@@ -91,9 +100,9 @@ responses provider are exposed in the embedded config.
 
 1. `cargo fmt --check`
 2. `cargo test`
-3. release binary build jobs
+3. Linux runner builds both `cx-linux-x86_64` and `cx-darwin-arm64` (the darwin build uses `cargo-zigbuild`)
 4. upload to GitLab Generic Package Registry
-5. GitLab Release creation with permanent asset links
+5. GitLab Release creation with permanent asset links using the built-in `CI_JOB_TOKEN`
 6. npm package publish to the GitLab npm registry
 
 ## Local development
