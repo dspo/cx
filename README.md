@@ -100,6 +100,9 @@ responses provider are exposed in the published baseline config.
 
 ## Local development
 
+The repo pins Rust 1.95.0 with `rust-toolchain.toml` and CI runs the same
+version.
+
 ```bash
 ./scripts/build.sh
 cargo test

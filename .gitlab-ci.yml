@@ -6,27 +6,36 @@ stages:
 
 default:
   interruptible: true
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - .cargo/registry/
+      - .cargo/git/db/
+      - .cargo/git/checkouts/
 
 variables:
   CARGO_TERM_COLOR: always
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
   ZIG_VERSION: "0.13.0"
 
 fmt:
   stage: validate
-  image: rust:1.85
+  image: rust:1.95.0
   script:
     - rustup component add rustfmt
     - cargo fmt --check
 
 test:
   stage: validate
-  image: rust:1.85
+  image: rust:1.95.0
   script:
     - cargo test
 
 build:linux-x86_64:
   stage: build
-  image: rust:1.85
+  image: rust:1.95.0
   script:
     - cargo build --release
     - mkdir -p dist
@@ -38,7 +47,7 @@ build:linux-x86_64:
 
 build:darwin-arm64:
   stage: build
-  image: rust:1.85
+  image: rust:1.95.0
   before_script:
     - apt-get update
     - apt-get install -y --no-install-recommends curl xz-utils ca-certificates
