@@ -11,7 +11,7 @@ use rand::RngCore;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
@@ -22,6 +22,8 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(windows)]
+use std::os::windows::fs::{symlink_dir, symlink_file};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,6 +32,8 @@ use url::Url;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROVIDER_CONFIG_FILE_NAME: &str = "cx.providers.config.yaml";
 const LEGACY_PROVIDER_CONFIG_FILE_NAME: &str = "config.yaml";
+const LAUNCH_HOME_DIR_NAME: &str = "cx-launch-homes";
+const LAUNCH_HOME_TTL_SECS: u64 = 60 * 60 * 24;
 
 mod embedded {
     include!(concat!(env!("OUT_DIR"), "/embedded_config.rs"));
@@ -555,6 +559,284 @@ fn write_string_atomic(path: &Path, content: &str) -> Result<()> {
         });
     }
 
+    Ok(())
+}
+
+fn ensure_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("创建目录失败: {}", path.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("设置目录权限失败: {}", path.display()))?;
+    Ok(())
+}
+
+fn write_private_file(path: &Path, content: &str) -> Result<()> {
+    write_string_atomic(path, content)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("设置文件权限失败: {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn symlink_path(src: &Path, dst: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+        .with_context(|| format!("创建符号链接失败: {} -> {}", dst.display(), src.display()))
+}
+
+#[cfg(windows)]
+fn symlink_path(src: &Path, dst: &Path) -> Result<()> {
+    let result = if src.is_dir() {
+        symlink_dir(src, dst)
+    } else {
+        symlink_file(src, dst)
+    };
+    result.with_context(|| format!("创建符号链接失败: {} -> {}", dst.display(), src.display()))
+}
+
+fn launch_homes_root() -> PathBuf {
+    env::temp_dir().join(LAUNCH_HOME_DIR_NAME)
+}
+
+fn sweep_old_launch_homes() -> Result<()> {
+    let root = launch_homes_root();
+    if !root.exists() {
+        return Ok(());
+    }
+
+    let now = current_unix_secs()?;
+    for entry in fs::read_dir(&root).with_context(|| format!("读取目录失败: {}", root.display()))?
+    {
+        let entry = entry.with_context(|| format!("读取目录项失败: {}", root.display()))?;
+        let path = entry.path();
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs());
+
+        if let Some(modified) = modified {
+            if now.saturating_sub(modified) <= LAUNCH_HOME_TTL_SECS {
+                continue;
+            }
+        }
+
+        if path.is_dir() {
+            let _ = fs::remove_dir_all(&path);
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    Ok(())
+}
+
+fn create_launch_home(agent_id: &str) -> Result<PathBuf> {
+    sweep_old_launch_homes()?;
+    let root = launch_homes_root();
+    ensure_private_dir(&root)?;
+    let dir = root.join(format!(
+        "{}-{}-{}",
+        agent_id,
+        current_unix_secs()?,
+        random_urlsafe(6)
+    ));
+    ensure_private_dir(&dir)?;
+    Ok(dir)
+}
+
+fn mirror_home_entries(real_home: &Path, fake_home: &Path, excluded: &[&str]) -> Result<()> {
+    ensure_private_dir(fake_home)?;
+    for entry in fs::read_dir(real_home)
+        .with_context(|| format!("读取主目录失败: {}", real_home.display()))?
+    {
+        let entry = entry.with_context(|| format!("读取目录项失败: {}", real_home.display()))?;
+        let name = entry.file_name();
+        let name_string = name.to_string_lossy();
+        if excluded
+            .iter()
+            .any(|excluded_name| *excluded_name == name_string)
+        {
+            continue;
+        }
+        symlink_path(&entry.path(), &fake_home.join(&name))?;
+    }
+    Ok(())
+}
+
+fn materialize_passthrough_dir(
+    real_dir: &Path,
+    fake_dir: &Path,
+    overridden: &[&str],
+) -> Result<()> {
+    ensure_private_dir(fake_dir)?;
+    if !real_dir.exists() {
+        return Ok(());
+    }
+
+    for entry in
+        fs::read_dir(real_dir).with_context(|| format!("读取目录失败: {}", real_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("读取目录项失败: {}", real_dir.display()))?;
+        let name = entry.file_name();
+        let name_string = name.to_string_lossy();
+        if overridden
+            .iter()
+            .any(|overridden_name| *overridden_name == name_string)
+        {
+            continue;
+        }
+        symlink_path(&entry.path(), &fake_dir.join(&name))?;
+    }
+    Ok(())
+}
+
+fn toml_basic_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn merge_codex_config(
+    existing: Option<&str>,
+    model: &ResolvedModel,
+    workspace_root: &Path,
+) -> Result<String> {
+    let project_section = format!(
+        "[projects.{}]",
+        toml_basic_string(&workspace_root.to_string_lossy())
+    );
+    let mut retained = Vec::new();
+    let mut skipping_section = false;
+
+    if let Some(existing) = existing {
+        for line in existing.lines() {
+            let trimmed = line.trim();
+            if skipping_section {
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    skipping_section = false;
+                } else {
+                    continue;
+                }
+            }
+
+            if trimmed == "[model_providers.dashscope]" || trimmed == project_section {
+                skipping_section = true;
+                continue;
+            }
+
+            if !trimmed.starts_with('[')
+                && (trimmed.starts_with("model =") || trimmed.starts_with("model_provider ="))
+            {
+                continue;
+            }
+
+            retained.push(line.to_string());
+        }
+    }
+
+    let wire_api = model.wire_api.launch_value()?;
+    let mut rendered = format!(
+        "model = {}\nmodel_provider = \"dashscope\"\n\n[model_providers.dashscope]\nname = \"DashScope\"\nbase_url = {}\nenv_key = \"DASHSCOPE_API_KEY\"\nwire_api = {}\n\n{}{}\ntrust_level = \"trusted\"\n",
+        toml_basic_string(&model.id),
+        toml_basic_string(&model.endpoint_url),
+        toml_basic_string(wire_api),
+        project_section,
+        "\n"
+    );
+
+    let retained = retained.join("\n").trim().to_string();
+    if !retained.is_empty() {
+        rendered.push('\n');
+        rendered.push_str(&retained);
+        rendered.push('\n');
+    }
+
+    Ok(rendered)
+}
+
+fn merge_claude_settings(
+    existing: Option<&str>,
+    env_overrides: &BTreeMap<String, String>,
+    model_override: Option<&str>,
+) -> Result<String> {
+    let mut root = match existing {
+        Some(existing) if !existing.trim().is_empty() => {
+            serde_json::from_str::<Value>(existing).context("解析 Claude settings.json 失败")?
+        }
+        _ => Value::Object(Map::new()),
+    };
+
+    let object = root
+        .as_object_mut()
+        .context("Claude settings.json 顶层必须是对象")?;
+
+    let env_value = object
+        .entry("env".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let env_object = env_value
+        .as_object_mut()
+        .context("Claude settings.json 中的 env 必须是对象")?;
+
+    for (key, value) in env_overrides {
+        env_object.insert(key.clone(), Value::String(value.clone()));
+    }
+
+    if let Some(model) = model_override {
+        object.insert("model".to_string(), Value::String(model.to_string()));
+    }
+
+    serde_json::to_string_pretty(&root).context("序列化 Claude settings.json 失败")
+}
+
+fn prepare_claude_launch_home(
+    env_overrides: &BTreeMap<String, String>,
+    model_override: Option<&str>,
+    env: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let real_home = home_dir().context("无法解析用户主目录")?;
+    let fake_home = create_launch_home("claude")?;
+    mirror_home_entries(&real_home, &fake_home, &[".claude"])?;
+
+    let real_claude_dir = real_home.join(".claude");
+    let fake_claude_dir = fake_home.join(".claude");
+    materialize_passthrough_dir(&real_claude_dir, &fake_claude_dir, &["settings.json"])?;
+
+    let existing_settings = fs::read_to_string(real_claude_dir.join("settings.json")).ok();
+    let merged_settings =
+        merge_claude_settings(existing_settings.as_deref(), env_overrides, model_override)?;
+    write_private_file(&fake_claude_dir.join("settings.json"), &merged_settings)?;
+
+    env.insert("HOME".into(), fake_home.display().to_string());
+    env.insert(
+        "XDG_CONFIG_HOME".into(),
+        fake_home.join(".config").display().to_string(),
+    );
+    Ok(())
+}
+
+fn prepare_codex_launch_home(
+    model: &ResolvedModel,
+    env: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let real_home = home_dir().context("无法解析用户主目录")?;
+    let fake_home = create_launch_home("codex")?;
+    mirror_home_entries(&real_home, &fake_home, &[".codex"])?;
+
+    let real_codex_dir = real_home.join(".codex");
+    let fake_codex_dir = fake_home.join(".codex");
+    materialize_passthrough_dir(&real_codex_dir, &fake_codex_dir, &["config.toml"])?;
+
+    let existing_config = fs::read_to_string(real_codex_dir.join("config.toml")).ok();
+    let merged_config =
+        merge_codex_config(existing_config.as_deref(), model, &env::current_dir()?)?;
+    write_private_file(&fake_codex_dir.join("config.toml"), &merged_config)?;
+
+    env.insert("HOME".into(), fake_home.display().to_string());
+    env.insert(
+        "XDG_CONFIG_HOME".into(),
+        fake_home.join(".config").display().to_string(),
+    );
+    env.insert("CODEX_HOME".into(), fake_codex_dir.display().to_string());
     Ok(())
 }
 
@@ -1511,11 +1793,13 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
             "claude" => {
                 env_remove.push("ANTHROPIC_API_KEY".into());
                 env_remove.push("ANTHROPIC_AUTH_TOKEN".into());
+                let mut settings_env = BTreeMap::new();
                 if let Some(ref source) = provider.apikey_source {
                     let key = resolve_apikey_interactive(source)?;
-                    env.insert("ANTHROPIC_API_KEY".into(), key.clone());
-                    env.insert("ANTHROPIC_AUTH_TOKEN".into(), key);
+                    settings_env.insert("ANTHROPIC_API_KEY".into(), key.clone());
+                    settings_env.insert("ANTHROPIC_AUTH_TOKEN".into(), key);
                 }
+                prepare_claude_launch_home(&settings_env, None, &mut env)?;
                 args.extend(passthrough_args.iter().cloned());
             }
             "codex" => {
@@ -1577,9 +1861,10 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
             "claude" => {
                 env_remove.push("ANTHROPIC_API_KEY".into());
                 env_remove.push("ANTHROPIC_AUTH_TOKEN".into());
-                env.insert("ANTHROPIC_BASE_URL".into(), model.endpoint_url.clone());
-                env.insert("ANTHROPIC_API_KEY".into(), apikey);
-                env.insert("ANTHROPIC_MODEL".into(), model.id.clone());
+                let mut settings_env = BTreeMap::new();
+                settings_env.insert("ANTHROPIC_BASE_URL".into(), model.endpoint_url.clone());
+                settings_env.insert("ANTHROPIC_API_KEY".into(), apikey);
+                prepare_claude_launch_home(&settings_env, Some(&model.id), &mut env)?;
                 args.extend(passthrough_args.iter().cloned());
             }
             "codex" => {
@@ -1591,23 +1876,7 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
                     );
                 }
                 env.insert("DASHSCOPE_API_KEY".into(), apikey);
-                args.extend([
-                    "-c".to_string(),
-                    r#"model_providers.dashscope.name="DashScope""#.to_string(),
-                    "-c".to_string(),
-                    format!(
-                        r#"model_providers.dashscope.base_url="{}""#,
-                        model.endpoint_url
-                    ),
-                    "-c".to_string(),
-                    r#"model_providers.dashscope.env_key="DASHSCOPE_API_KEY""#.to_string(),
-                    "-c".to_string(),
-                    r#"model_providers.dashscope.wire_api="responses""#.to_string(),
-                    "-c".to_string(),
-                    r#"model_provider="dashscope""#.to_string(),
-                    "-c".to_string(),
-                    format!(r#"model="{}""#, model.id),
-                ]);
+                prepare_codex_launch_home(model, &mut env)?;
                 args.extend(passthrough_args.iter().cloned());
             }
             _ => {
@@ -2341,6 +2610,21 @@ mod tests {
         env::temp_dir().join(format!("cx-{label}-{}", random_urlsafe(6)))
     }
 
+    fn test_resolved_model(model_id: &str, endpoint_url: &str, wire_api: WireApi) -> ResolvedModel {
+        ResolvedModel {
+            id: model_id.into(),
+            arena: "—".into(),
+            swe_p: "—".into(),
+            tb2: "—".into(),
+            desc: String::new(),
+            wire_api,
+            provider_name: "DashScope".into(),
+            endpoint_url: endpoint_url.into(),
+            visible_agents: vec!["codex".into(), "claude".into()],
+            copilot_auth: CopilotAuth::ApiKey,
+        }
+    }
+
     // ── clap CLI parsing tests ──
 
     fn parse(args: &[&str]) -> Option<CxCommand> {
@@ -2449,10 +2733,14 @@ mod tests {
             spec.env_remove
                 .contains(&"ANTHROPIC_AUTH_TOKEN".to_string())
         );
-        assert_eq!(
-            spec.env.get("ANTHROPIC_API_KEY").map(String::as_str),
-            Some("test-key")
-        );
+        let fake_home = PathBuf::from(spec.env.get("HOME").unwrap());
+        let settings: Value = serde_json::from_str(
+            &fs::read_to_string(fake_home.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["env"]["ANTHROPIC_API_KEY"], "test-key");
+        assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "test-key");
+        let _ = fs::remove_dir_all(fake_home);
     }
 
     #[test]
@@ -2484,10 +2772,18 @@ mod tests {
             spec.env_remove
                 .contains(&"ANTHROPIC_AUTH_TOKEN".to_string())
         );
+        let fake_home = PathBuf::from(spec.env.get("HOME").unwrap());
+        let settings: Value = serde_json::from_str(
+            &fs::read_to_string(fake_home.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            spec.env.get("ANTHROPIC_BASE_URL").map(String::as_str),
-            Some("https://dashscope.aliyuncs.com/apps/anthropic")
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            "https://dashscope.aliyuncs.com/apps/anthropic"
         );
+        assert_eq!(settings["env"]["ANTHROPIC_API_KEY"], "test-key");
+        assert_eq!(settings["model"], "qwen3.6-plus");
+        let _ = fs::remove_dir_all(fake_home);
     }
 
     // ── Merge tests ──
@@ -2653,6 +2949,100 @@ mod tests {
         let ids: Vec<&str> = merged.iter().map(|agent| agent.id.as_str()).collect();
         assert_eq!(ids, vec!["copilot", "claude", "codex", "gemini"]);
         assert_eq!(merged[1].binary, "claude-new");
+    }
+
+    #[test]
+    fn merge_codex_config_rewrites_provider_and_project_section() {
+        let existing = r#"
+model = "old-model"
+model_provider = "old-provider"
+approval_policy = "on-request"
+
+[model_providers.dashscope]
+name = "Old"
+base_url = "https://old.example.com"
+env_key = "OLD_KEY"
+wire_api = "responses"
+
+[projects."/tmp/workspace"]
+trust_level = "untrusted"
+
+[projects."/tmp/other"]
+trust_level = "trusted"
+"#;
+
+        let merged = merge_codex_config(
+            Some(existing),
+            &test_resolved_model(
+                "qwen3.6-plus",
+                "https://dashscope.aliyuncs.com/v1",
+                WireApi::Responses,
+            ),
+            Path::new("/tmp/workspace"),
+        )
+        .unwrap();
+
+        assert!(merged.contains(r#"model = "qwen3.6-plus""#));
+        assert!(merged.contains(r#"base_url = "https://dashscope.aliyuncs.com/v1""#));
+        assert!(merged.contains(r#"[projects."/tmp/workspace"]"#));
+        assert!(merged.contains(r#"trust_level = "trusted""#));
+        assert!(merged.contains(r#"approval_policy = "on-request""#));
+        assert!(merged.contains(r#"[projects."/tmp/other"]"#));
+        assert!(!merged.contains("https://old.example.com"));
+    }
+
+    #[test]
+    fn merge_claude_settings_preserves_existing_keys_and_overrides_env() {
+        let existing = r#"{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "model": "opus[1m]",
+  "theme": "light"
+}"#;
+        let mut env_overrides = BTreeMap::new();
+        env_overrides.insert(
+            "ANTHROPIC_BASE_URL".into(),
+            "https://dashscope.aliyuncs.com/apps/anthropic".into(),
+        );
+        env_overrides.insert("ANTHROPIC_API_KEY".into(), "test-key".into());
+
+        let merged =
+            merge_claude_settings(Some(existing), &env_overrides, Some("qwen3.6-plus")).unwrap();
+        let merged: Value = serde_json::from_str(&merged).unwrap();
+
+        assert_eq!(merged["theme"], "light");
+        assert_eq!(merged["model"], "qwen3.6-plus");
+        assert_eq!(merged["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"], "1");
+        assert_eq!(
+            merged["env"]["ANTHROPIC_BASE_URL"],
+            "https://dashscope.aliyuncs.com/apps/anthropic"
+        );
+        assert_eq!(merged["env"]["ANTHROPIC_API_KEY"], "test-key");
+    }
+
+    #[test]
+    fn materialize_passthrough_dir_skips_overridden_entries() {
+        let root = temp_test_dir("passthrough-dir");
+        let real = root.join("real");
+        let fake = root.join("fake");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("keep.txt"), "ok").unwrap();
+        fs::write(real.join("override.txt"), "skip").unwrap();
+
+        materialize_passthrough_dir(&real, &fake, &["override.txt"]).unwrap();
+
+        assert!(fake.join("keep.txt").exists());
+        assert!(!fake.join("override.txt").exists());
+        #[cfg(unix)]
+        assert!(
+            fs::symlink_metadata(fake.join("keep.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
