@@ -2610,6 +2610,16 @@ mod tests {
         env::temp_dir().join(format!("cx-{label}-{}", random_urlsafe(6)))
     }
 
+    fn create_fake_binary(name: &str) -> PathBuf {
+        let dir = temp_test_dir("fake-binary");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     fn test_resolved_model(model_id: &str, endpoint_url: &str, wire_api: WireApi) -> ResolvedModel {
         ResolvedModel {
             id: model_id.into(),
@@ -2700,9 +2710,10 @@ mod tests {
 
     #[test]
     fn codex_mcp_passthrough_stays_raw_without_endpoints() {
+        let fake_binary = create_fake_binary("codex");
         let selection = Selection {
             agent_id: "codex".into(),
-            agent_binary: "codex".into(),
+            agent_binary: fake_binary.display().to_string(),
             provider: ResolvedProvider {
                 name: "Codex Default".into(),
                 has_endpoints: false,
@@ -2713,13 +2724,15 @@ mod tests {
 
         let spec = build_launch_spec(&selection, &["mcp".into(), "serve".into()]).unwrap();
         assert_eq!(spec.args, vec!["mcp".to_string(), "serve".to_string()]);
+        let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
     }
 
     #[test]
     fn claude_launch_removes_anthropic_env_vars() {
+        let fake_binary = create_fake_binary("claude");
         let selection = Selection {
             agent_id: "claude".into(),
-            agent_binary: "claude".into(),
+            agent_binary: fake_binary.display().to_string(),
             provider: ResolvedProvider {
                 name: "Test".into(),
                 has_endpoints: false,
@@ -2741,13 +2754,15 @@ mod tests {
         assert_eq!(settings["env"]["ANTHROPIC_API_KEY"], "test-key");
         assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "test-key");
         let _ = fs::remove_dir_all(fake_home);
+        let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
     }
 
     #[test]
     fn claude_with_endpoint_removes_anthropic_env_vars() {
+        let fake_binary = create_fake_binary("claude");
         let selection = Selection {
             agent_id: "claude".into(),
-            agent_binary: "claude".into(),
+            agent_binary: fake_binary.display().to_string(),
             provider: ResolvedProvider {
                 name: "DashScope".into(),
                 has_endpoints: true,
@@ -2784,6 +2799,7 @@ mod tests {
         assert_eq!(settings["env"]["ANTHROPIC_API_KEY"], "test-key");
         assert_eq!(settings["model"], "qwen3.6-plus");
         let _ = fs::remove_dir_all(fake_home);
+        let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
     }
 
     // ── Merge tests ──
@@ -3099,7 +3115,9 @@ trust_level = "trusted"
 
     #[test]
     fn resolve_binary_finds_codex_cli() {
-        let path = resolve_binary("codex").unwrap();
-        assert!(path.ends_with("codex"));
+        let fake_binary = create_fake_binary("codex");
+        let path = resolve_binary(&fake_binary.display().to_string()).unwrap();
+        assert_eq!(path, fake_binary);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }
