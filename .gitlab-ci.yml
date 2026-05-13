@@ -28,7 +28,7 @@ variables:
   RUSTUP_HOME: "$CI_PROJECT_DIR/.rustup"
   RUSTUP_DIST_SERVER: "https://rsproxy.cn"
   RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
-  DARWIN_BUILDER_IMAGE: "joseluisq/rust-linux-darwin-builder:1.89.0"
+  DARWIN_BUILDER_IMAGE: "joseluisq/rust-linux-darwin-builder:2.0.0-beta.1"
 
 fmt:
   stage: validate
