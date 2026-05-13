@@ -75,6 +75,26 @@ build:darwin-arm64:
       - dist/
     expire_in: 1 week
 
+build:darwin-x86_64:
+  stage: build
+  image: rust:1.95.0
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends curl xz-utils ca-certificates
+    - curl --fail --show-error --location --output zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+    - tar -xf zig.tar.xz
+    - export PATH="${PWD}/zig-linux-x86_64-${ZIG_VERSION}:${PATH}"
+    - cargo install --locked cargo-zigbuild
+    - rustup target add x86_64-apple-darwin --toolchain 1.95.0-x86_64-unknown-linux-gnu
+  script:
+    - cargo zigbuild --release --target x86_64-apple-darwin
+    - mkdir -p dist
+    - cp target/x86_64-apple-darwin/release/cx dist/cx-darwin-x86_64
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+
 publish:release-assets:
   stage: publish
   image: alpine:3.20
@@ -87,6 +107,7 @@ publish:release-assets:
     - test -n "$(find dist -maxdepth 1 -type f | head -n 1)"
     - test -f dist/cx-linux-x86_64
     - test -f dist/cx-darwin-arm64
+    - test -f dist/cx-darwin-x86_64
     - VERSION="${CI_COMMIT_TAG#v}"
     - PACKAGE_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/cx/${VERSION}"
     - cp scripts/install-release.sh dist/install.sh
