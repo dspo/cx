@@ -7,7 +7,6 @@ DIST_DIR ?= dist
 PROJECT_ID ?=
 GITLAB_TOKEN ?=
 GITLAB_HOST ?= git.huayi.tech
-ENFORCE_EMBEDDED_SECRETS ?=
 
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
@@ -48,9 +47,6 @@ test: ## Run cargo tests
 check: fmt test ## Run formatting and tests
 
 build: ## Build the release binary
-	@if [[ -n "$(ENFORCE_EMBEDDED_SECRETS)" ]]; then \
-		export CX_ENFORCE_EMBEDDED_SECRETS="$(ENFORCE_EMBEDDED_SECRETS)"; \
-	fi; \
 	cargo build --release
 
 install: ## Install cx to ~/.local/bin via scripts/install.sh

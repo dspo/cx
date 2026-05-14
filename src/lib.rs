@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -10,23 +11,29 @@ use rand::RngCore;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Write as IoWrite};
 use std::net::TcpListener;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+#[cfg(windows)]
+use std::os::windows::fs::{symlink_dir, symlink_file};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const PROVIDER_CONFIG_FILE_NAME: &str = "cx.providers.config.yaml";
+const LEGACY_PROVIDER_CONFIG_FILE_NAME: &str = "config.yaml";
+const LAUNCH_HOME_DIR_NAME: &str = "cx-launch-homes";
+const LAUNCH_HOME_TTL_SECS: u64 = 60 * 60 * 24;
 
 mod embedded {
     include!(concat!(env!("OUT_DIR"), "/embedded_config.rs"));
@@ -36,7 +43,7 @@ mod embedded {
 // 配置结构体（从 YAML 反序列化）
 // ══════════════════════════════════════════════════
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct CxConfig {
     #[serde(default)]
     providers: Vec<ProviderConfig>,
@@ -44,7 +51,7 @@ struct CxConfig {
     agents: Vec<AgentConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ProviderConfig {
     name: String,
     #[serde(default)]
@@ -57,14 +64,14 @@ struct ProviderConfig {
     endpoints: BTreeMap<String, ProviderEndpointSpec>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 enum ProviderEndpointSpec {
     Url(String),
     Detailed(ProviderEndpointDetail),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ProviderEndpointDetail {
     url: String,
     #[serde(default)]
@@ -92,7 +99,7 @@ struct ModelConfig {
     agents: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct ProviderModelConfig {
     #[serde(default)]
     arena: Option<String>,
@@ -108,7 +115,7 @@ struct ProviderModelConfig {
     agents: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct AgentConfig {
     id: String,
     #[serde(alias = "bin")]
@@ -485,10 +492,363 @@ fn unsupported_codex_app_message() -> &'static str {
 // 配置加载
 // ══════════════════════════════════════════════════
 
+fn provider_config_path() -> Result<PathBuf> {
+    Ok(cx_state_dir()?.join(PROVIDER_CONFIG_FILE_NAME))
+}
+
+fn legacy_provider_config_path() -> Result<PathBuf> {
+    Ok(cx_state_dir()?.join(LEGACY_PROVIDER_CONFIG_FILE_NAME))
+}
+
+fn migrate_legacy_provider_config(current_path: &Path, legacy_path: &Path) -> Result<bool> {
+    if current_path.exists() || !legacy_path.exists() {
+        return Ok(false);
+    }
+
+    if let Some(parent) = current_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
+    }
+
+    fs::rename(legacy_path, current_path).with_context(|| {
+        format!(
+            "迁移旧配置失败: {} -> {}",
+            legacy_path.display(),
+            current_path.display()
+        )
+    })?;
+    eprintln!("已将旧 Provider 配置迁移到 {}", current_path.display());
+    Ok(true)
+}
+
+fn active_provider_config_path() -> Result<PathBuf> {
+    let current_path = provider_config_path()?;
+    let legacy_path = legacy_provider_config_path()?;
+    migrate_legacy_provider_config(&current_path, &legacy_path)?;
+    Ok(current_path)
+}
+
+fn read_config_file(path: &Path) -> Result<CxConfig> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("读取配置文件失败: {}", path.display()))?;
+    serde_yaml::from_str(&content).with_context(|| format!("解析配置文件失败: {}", path.display()))
+}
+
+fn write_string_atomic(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(PROVIDER_CONFIG_FILE_NAME);
+    let tmp_path = path.with_file_name(format!(".{file_name}.{}.tmp", random_urlsafe(6)));
+    fs::write(&tmp_path, content)
+        .with_context(|| format!("写入临时配置文件失败: {}", tmp_path.display()))?;
+
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err).with_context(|| {
+            format!(
+                "替换配置文件失败: {} -> {}",
+                tmp_path.display(),
+                path.display()
+            )
+        });
+    }
+
+    Ok(())
+}
+
+fn ensure_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("创建目录失败: {}", path.display()))?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("设置目录权限失败: {}", path.display()))?;
+    Ok(())
+}
+
+fn write_private_file(path: &Path, content: &str) -> Result<()> {
+    write_string_atomic(path, content)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("设置文件权限失败: {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn symlink_path(src: &Path, dst: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+        .with_context(|| format!("创建符号链接失败: {} -> {}", dst.display(), src.display()))
+}
+
+#[cfg(windows)]
+fn symlink_path(src: &Path, dst: &Path) -> Result<()> {
+    let result = if src.is_dir() {
+        symlink_dir(src, dst)
+    } else {
+        symlink_file(src, dst)
+    };
+    result.with_context(|| format!("创建符号链接失败: {} -> {}", dst.display(), src.display()))
+}
+
+fn launch_homes_root() -> PathBuf {
+    env::temp_dir().join(LAUNCH_HOME_DIR_NAME)
+}
+
+fn sweep_old_launch_homes() -> Result<()> {
+    let root = launch_homes_root();
+    if !root.exists() {
+        return Ok(());
+    }
+
+    let now = current_unix_secs()?;
+    for entry in fs::read_dir(&root).with_context(|| format!("读取目录失败: {}", root.display()))?
+    {
+        let entry = entry.with_context(|| format!("读取目录项失败: {}", root.display()))?;
+        let path = entry.path();
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs());
+
+        if let Some(modified) = modified {
+            if now.saturating_sub(modified) <= LAUNCH_HOME_TTL_SECS {
+                continue;
+            }
+        }
+
+        if path.is_dir() {
+            let _ = fs::remove_dir_all(&path);
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    Ok(())
+}
+
+fn create_launch_home(agent_id: &str) -> Result<PathBuf> {
+    sweep_old_launch_homes()?;
+    let root = launch_homes_root();
+    ensure_private_dir(&root)?;
+    let dir = root.join(format!(
+        "{}-{}-{}",
+        agent_id,
+        current_unix_secs()?,
+        random_urlsafe(6)
+    ));
+    ensure_private_dir(&dir)?;
+    Ok(dir)
+}
+
+fn mirror_home_entries(real_home: &Path, fake_home: &Path, excluded: &[&str]) -> Result<()> {
+    ensure_private_dir(fake_home)?;
+    for entry in fs::read_dir(real_home)
+        .with_context(|| format!("读取主目录失败: {}", real_home.display()))?
+    {
+        let entry = entry.with_context(|| format!("读取目录项失败: {}", real_home.display()))?;
+        let name = entry.file_name();
+        let name_string = name.to_string_lossy();
+        if excluded
+            .iter()
+            .any(|excluded_name| *excluded_name == name_string)
+        {
+            continue;
+        }
+        symlink_path(&entry.path(), &fake_home.join(&name))?;
+    }
+    Ok(())
+}
+
+fn materialize_passthrough_dir(
+    real_dir: &Path,
+    fake_dir: &Path,
+    overridden: &[&str],
+) -> Result<()> {
+    ensure_private_dir(fake_dir)?;
+    if !real_dir.exists() {
+        return Ok(());
+    }
+
+    for entry in
+        fs::read_dir(real_dir).with_context(|| format!("读取目录失败: {}", real_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("读取目录项失败: {}", real_dir.display()))?;
+        let name = entry.file_name();
+        let name_string = name.to_string_lossy();
+        if overridden
+            .iter()
+            .any(|overridden_name| *overridden_name == name_string)
+        {
+            continue;
+        }
+        symlink_path(&entry.path(), &fake_dir.join(&name))?;
+    }
+    Ok(())
+}
+
+fn toml_basic_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn merge_codex_config(
+    existing: Option<&str>,
+    model: &ResolvedModel,
+    workspace_root: &Path,
+) -> Result<String> {
+    let project_section = format!(
+        "[projects.{}]",
+        toml_basic_string(&workspace_root.to_string_lossy())
+    );
+    let mut retained = Vec::new();
+    let mut skipping_section = false;
+
+    if let Some(existing) = existing {
+        for line in existing.lines() {
+            let trimmed = line.trim();
+            if skipping_section {
+                if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                    skipping_section = false;
+                } else {
+                    continue;
+                }
+            }
+
+            if trimmed == "[model_providers.dashscope]" || trimmed == project_section {
+                skipping_section = true;
+                continue;
+            }
+
+            if !trimmed.starts_with('[')
+                && (trimmed.starts_with("model =") || trimmed.starts_with("model_provider ="))
+            {
+                continue;
+            }
+
+            retained.push(line.to_string());
+        }
+    }
+
+    let wire_api = model.wire_api.launch_value()?;
+    let mut rendered = format!(
+        "model = {}\nmodel_provider = \"dashscope\"\n\n[model_providers.dashscope]\nname = \"DashScope\"\nbase_url = {}\nenv_key = \"DASHSCOPE_API_KEY\"\nwire_api = {}\n\n{}{}\ntrust_level = \"trusted\"\n",
+        toml_basic_string(&model.id),
+        toml_basic_string(&model.endpoint_url),
+        toml_basic_string(wire_api),
+        project_section,
+        "\n"
+    );
+
+    let retained = retained.join("\n").trim().to_string();
+    if !retained.is_empty() {
+        rendered.push('\n');
+        rendered.push_str(&retained);
+        rendered.push('\n');
+    }
+
+    Ok(rendered)
+}
+
+fn merge_claude_settings(
+    existing: Option<&str>,
+    env_overrides: &BTreeMap<String, String>,
+    model_override: Option<&str>,
+) -> Result<String> {
+    let mut root = match existing {
+        Some(existing) if !existing.trim().is_empty() => {
+            serde_json::from_str::<Value>(existing).context("解析 Claude settings.json 失败")?
+        }
+        _ => Value::Object(Map::new()),
+    };
+
+    let object = root
+        .as_object_mut()
+        .context("Claude settings.json 顶层必须是对象")?;
+
+    let env_value = object
+        .entry("env".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let env_object = env_value
+        .as_object_mut()
+        .context("Claude settings.json 中的 env 必须是对象")?;
+
+    for (key, value) in env_overrides {
+        env_object.insert(key.clone(), Value::String(value.clone()));
+    }
+
+    if let Some(model) = model_override {
+        object.insert("model".to_string(), Value::String(model.to_string()));
+    }
+
+    serde_json::to_string_pretty(&root).context("序列化 Claude settings.json 失败")
+}
+
+fn prepare_claude_launch_home(
+    env_overrides: &BTreeMap<String, String>,
+    model_override: Option<&str>,
+    env: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let real_home = home_dir().context("无法解析用户主目录")?;
+    let fake_home = create_launch_home("claude")?;
+    mirror_home_entries(&real_home, &fake_home, &[".claude"])?;
+
+    let real_claude_dir = real_home.join(".claude");
+    let fake_claude_dir = fake_home.join(".claude");
+    materialize_passthrough_dir(&real_claude_dir, &fake_claude_dir, &["settings.json"])?;
+
+    let existing_settings = fs::read_to_string(real_claude_dir.join("settings.json")).ok();
+    let merged_settings =
+        merge_claude_settings(existing_settings.as_deref(), env_overrides, model_override)?;
+    write_private_file(&fake_claude_dir.join("settings.json"), &merged_settings)?;
+
+    env.insert("HOME".into(), fake_home.display().to_string());
+    env.insert(
+        "XDG_CONFIG_HOME".into(),
+        fake_home.join(".config").display().to_string(),
+    );
+    Ok(())
+}
+
+fn prepare_codex_launch_home(
+    model: &ResolvedModel,
+    env: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let real_home = home_dir().context("无法解析用户主目录")?;
+    let fake_home = create_launch_home("codex")?;
+    mirror_home_entries(&real_home, &fake_home, &[".codex"])?;
+
+    let real_codex_dir = real_home.join(".codex");
+    let fake_codex_dir = fake_home.join(".codex");
+    materialize_passthrough_dir(&real_codex_dir, &fake_codex_dir, &["config.toml"])?;
+
+    let existing_config = fs::read_to_string(real_codex_dir.join("config.toml")).ok();
+    let merged_config =
+        merge_codex_config(existing_config.as_deref(), model, &env::current_dir()?)?;
+    write_private_file(&fake_codex_dir.join("config.toml"), &merged_config)?;
+
+    env.insert("HOME".into(), fake_home.display().to_string());
+    env.insert(
+        "XDG_CONFIG_HOME".into(),
+        fake_home.join(".config").display().to_string(),
+    );
+    env.insert("CODEX_HOME".into(), fake_codex_dir.display().to_string());
+    Ok(())
+}
+
 fn load_config() -> Result<CxConfig> {
-    let config: CxConfig = serde_yaml::from_str(embedded::EMBEDDED_CONFIG_YAML)
-        .context("解析内嵌配置失败：请检查 build.rs 生成的 embedded config")?;
-    Ok(config)
+    let path = active_provider_config_path()?;
+    if !path.exists() {
+        bail!(
+            "Provider 配置不存在: {}\n请先运行 `cx patch --url <url>` 导入，或手动创建该 YAML 文件。",
+            path.display()
+        );
+    }
+    read_config_file(&path)
 }
 
 fn resolve_apikey(source: &str) -> Result<String> {
@@ -688,7 +1048,7 @@ fn wait_for_oauth_callback(
     Ok(params)
 }
 
-fn write_callback_response(stream: &mut impl Write, title: &str, body: &str) -> Result<()> {
+fn write_callback_response(stream: &mut impl IoWrite, title: &str, body: &str) -> Result<()> {
     let html = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head>\
          <body><h1>{title}</h1><p>{body}</p></body></html>"
@@ -1016,128 +1376,102 @@ fn models_for_provider(
 }
 
 // ══════════════════════════════════════════════════
-// 入口 & Invocation
+// CLI definition（clap derive）
+// ══════════════════════════════════════════════════
+
+#[derive(Parser)]
+#[command(
+    name = "cx",
+    about = "统一 Agent 入口",
+    version = VERSION,
+    disable_help_subcommand = true,
+    disable_version_flag = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<CxCommand>,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+enum CxCommand {
+    /// 显示帮助信息
+    Help,
+    /// 完成 GitLab 登录
+    Login,
+    /// 清除本地 GitLab 登录状态
+    Logout,
+    /// 显示当前登录用户
+    Whoami,
+    /// 探测模型的 completions / responses 支持情况
+    Probe {
+        /// 模型 ID（可选，不指定则探测全部）
+        model_id: Option<String>,
+    },
+    /// 从远程 URL 下载 Provider 配置并合并到本地
+    Patch {
+        /// 远程配置 YAML 文件的 URL
+        #[arg(long)]
+        url: Option<String>,
+        /// 使用上次记录的 URL 重新获取配置
+        #[arg(long)]
+        refresh: bool,
+    },
+}
+
+// ══════════════════════════════════════════════════
+// 入口
 // ══════════════════════════════════════════════════
 
 pub fn run() -> Result<()> {
+    let raw_args: Vec<String> = env::args().collect();
+
+    // patch command does not require a config file or login
+    if raw_args.get(1).map(String::as_str) == Some("patch") {
+        if let Ok(cli) = Cli::try_parse_from(&raw_args) {
+            if let Some(CxCommand::Patch { url, refresh }) = cli.command {
+                return run_patch(url, refresh);
+            }
+        }
+    }
+
     let config = load_config()?;
 
-    match parse_invocation(env::args().skip(1).collect(), &config) {
-        Invocation::Help => {
-            print_help();
-            Ok(())
-        }
-        Invocation::Version => {
-            println!("cx {VERSION}");
-            Ok(())
-        }
-        Invocation::Login => run_login(),
-        Invocation::Logout => run_logout(),
-        Invocation::Whoami => run_whoami(),
-        Invocation::Probe { target_model } => {
-            let _auth = require_login()?;
-            run_probe(target_model, &config)
-        }
-        Invocation::Unsupported { message } => bail!(message),
-        Invocation::Launch {
-            agent_hint,
-            passthrough_args,
-        } => {
-            let _auth = require_login()?;
-            run_launcher(agent_hint, &config, passthrough_args)
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Invocation {
-    Help,
-    Version,
-    Login,
-    Logout,
-    Whoami,
-    Probe {
-        target_model: Option<String>,
-    },
-    Unsupported {
-        message: String,
-    },
-    Launch {
-        agent_hint: Option<String>,
-        passthrough_args: Vec<String>,
-    },
-}
-
-fn parse_invocation(args: Vec<String>, config: &CxConfig) -> Invocation {
-    match args.first().map(String::as_str) {
-        None => Invocation::Launch {
-            agent_hint: None,
-            passthrough_args: Vec::new(),
-        },
-        Some("-h") | Some("--help") | Some("help") => Invocation::Help,
-        Some("-V") | Some("--version") | Some("version") => Invocation::Version,
-        Some("login") => Invocation::Login,
-        Some("logout") => Invocation::Logout,
-        Some("whoami") => Invocation::Whoami,
-        Some("probe") => Invocation::Probe {
-            target_model: args.get(1).cloned(),
-        },
-        Some("codex-app") => Invocation::Unsupported {
-            message: unsupported_codex_app_message().to_string(),
-        },
-        Some("codex") if args.get(1).map(String::as_str) == Some("app") => {
-            Invocation::Unsupported {
-                message: unsupported_codex_app_message().to_string(),
+    match Cli::try_parse_from(&raw_args) {
+        Ok(cli) => match cli.command {
+            Some(CxCommand::Help) | None => {
+                print_help();
+                Ok(())
             }
-        }
-        Some(first) => {
-            if find_agent(config, first).is_some() {
-                Invocation::Launch {
-                    agent_hint: Some(canonical_agent_id(first).to_string()),
-                    passthrough_args: args[1..].to_vec(),
+            Some(CxCommand::Login) => run_login(),
+            Some(CxCommand::Logout) => run_logout(),
+            Some(CxCommand::Whoami) => run_whoami(),
+            Some(CxCommand::Probe { model_id }) => {
+                let _auth = require_login()?;
+                run_probe(model_id, &config)
+            }
+            Some(CxCommand::Patch { .. }) => {
+                unreachable!("patch is handled before config load")
+            }
+        },
+        Err(_) => {
+            // Not a known subcommand → treat as Launch with agent hint
+            let args: Vec<String> = raw_args[1..].to_vec();
+            let _auth = require_login()?;
+
+            if let Some(first) = args.first() {
+                if first == "codex-app"
+                    || (first == "codex" && args.get(1).map(String::as_str) == Some("app"))
+                {
+                    bail!(unsupported_codex_app_message());
                 }
-            } else {
-                Invocation::Launch {
-                    agent_hint: None,
-                    passthrough_args: args,
+                if let Some(agent) = find_agent(&config, first) {
+                    return run_launcher(Some(agent.id), &config, args[1..].to_vec());
                 }
             }
+
+            run_launcher(None, &config, args)
         }
     }
-}
-
-fn print_help() {
-    println!(
-        "\
-cx {VERSION}
-
-用法：
-  cx
-  cx <agent> [args...]
-  cx login
-  cx logout
-  cx whoami
-  cx probe [model-id]
-  cx --help
-  cx --version
-
-说明：
-  - 运行 cx 时，总是会先进入交互式选择 Provider / Model。
-  - `cx <agent> [args...]` 会跳过 agent 选择，但仍进入 Provider / Model 选择。
-  - 选择完成后，剩余参数会原样透传给最终原生 CLI。
-  - `cx` 不代理 `codex app` 桌面端；如需桌面端请直接运行原生 `codex app ...`。
-  - 内嵌版要求先运行 `cx login` 完成 GitLab 登录，然后才能启动 agent 或执行 probe。
-  - `probe` 用于探测模型对 completions / responses 的支持情况。
-
-示例：
-  cx login
-  cx
-  cx claude mcp list
-  cx codex --approval-mode on-request
-  cx whoami
-  cx probe
-  cx probe qwen3.6-plus"
-    );
 }
 
 // ══════════════════════════════════════════════════
@@ -1174,17 +1508,225 @@ fn run_launcher(
 
 fn print_add_provider_guide(agent_id: &str) {
     println!();
-    println!("内嵌版不支持为 {agent_id} 在本地追加 Provider。");
+    println!("为 {agent_id} 添加 Provider：");
     println!();
-    println!("1. 请修改仓库中的 config/internal.config.yaml 模板。");
-    println!("2. 如需密钥，请在 GitLab CI/CD Variables 中补齐对应变量。");
-    println!("3. 通过 GitLab MR 更新后重新构建发布。");
+    println!("1. 运行 `cx patch --url <url>` 从远程下载 Provider 配置。");
+    println!("2. 或手动编辑 ~/.config/cx/cx.providers.config.yaml 的 providers 列表。");
+    println!("3. 仓库中的 `config/providers.default.yaml` 可作为基线示例。");
+    println!("4. 配置格式参考: docs/cx-config-schema.yaml");
     println!();
+}
+
+fn print_help() {
+    Cli::parse_from(["cx", "--help"]);
+}
+
+// ══════════════════════════════════════════════════
+// Patch — 远程 Provider 配置合并
+// ══════════════════════════════════════════════════
+
+fn patch_source_path() -> Result<PathBuf> {
+    let home = home_dir().context("无法解析用户主目录")?;
+    Ok(home.join(".config/cx/.patch_source"))
+}
+
+fn save_patch_source(url: &str) -> Result<()> {
+    let path = patch_source_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
+    }
+    fs::write(&path, url).with_context(|| "保存 patch 来源 URL 失败")?;
+    Ok(())
+}
+
+fn load_patch_source() -> Result<String> {
+    let path = patch_source_path()?;
+    fs::read_to_string(&path)
+        .map(|s| s.trim().to_string())
+        .with_context(|| {
+            format!(
+                "未找到 patch 来源 URL，请先运行 `cx patch --url <url>`: {}",
+                path.display()
+            )
+        })
+}
+
+fn run_patch(url: Option<String>, refresh: bool) -> Result<()> {
+    let url = if refresh {
+        load_patch_source()?
+    } else if let Some(ref u) = url {
+        u.clone()
+    } else {
+        bail!("请指定 --url <url> 或 --refresh")
+    };
+
+    println!("从 {} 下载 Provider 配置...", url);
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("初始化 HTTP 客户端失败")?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .with_context(|| format!("下载配置失败: {url}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        bail!("下载配置失败: HTTP {}", status.as_u16());
+    }
+
+    let body = response.text().context("读取响应失败")?;
+    let incoming: CxConfig = serde_yaml::from_str(&body).with_context(|| "解析远程配置失败")?;
+
+    let config_path = active_provider_config_path()?;
+    let existing = if config_path.exists() {
+        read_config_file(&config_path)?
+    } else {
+        CxConfig::default()
+    };
+
+    let merged = CxConfig {
+        providers: merge_providers(&existing.providers, &incoming.providers),
+        agents: merge_agents(&existing.agents, &incoming.agents),
+    };
+
+    let yaml = serde_yaml::to_string(&merged).context("序列化配置失败")?;
+    write_string_atomic(&config_path, &yaml)?;
+
+    save_patch_source(&url)?;
+
+    println!("配置已更新: {}", config_path.display());
+    println!("来源 URL 已记录，后续可通过 `cx patch --refresh` 更新。");
+
+    Ok(())
+}
+
+/// Replace providers by `name`; new providers are appended.
+/// Preserves existing order; incoming replacements stay in-place, new items are appended at end.
+fn merge_providers(
+    existing: &[ProviderConfig],
+    incoming: &[ProviderConfig],
+) -> Vec<ProviderConfig> {
+    let mut replaced = vec![false; incoming.len()];
+    let mut result = Vec::with_capacity(existing.len() + incoming.len());
+
+    for existing_provider in existing {
+        if let Some((index, replacement)) = incoming
+            .iter()
+            .enumerate()
+            .find(|(_, provider)| provider.name == existing_provider.name)
+        {
+            replaced[index] = true;
+            result.push(replacement.clone());
+        } else {
+            result.push(existing_provider.clone());
+        }
+    }
+
+    for (index, provider) in incoming.iter().enumerate() {
+        if !replaced[index] {
+            result.push(provider.clone());
+        }
+    }
+
+    result
+}
+
+/// Replace agents by `id`; new agents are appended.
+/// Preserves existing order; incoming replacements stay in-place, new items are appended at end.
+fn merge_agents(existing: &[AgentConfig], incoming: &[AgentConfig]) -> Vec<AgentConfig> {
+    let mut replaced = vec![false; incoming.len()];
+    let mut result = Vec::with_capacity(existing.len() + incoming.len());
+
+    for existing_agent in existing {
+        if let Some((index, replacement)) = incoming
+            .iter()
+            .enumerate()
+            .find(|(_, agent)| agent.id == existing_agent.id)
+        {
+            replaced[index] = true;
+            result.push(replacement.clone());
+        } else {
+            result.push(existing_agent.clone());
+        }
+    }
+
+    for (index, agent) in incoming.iter().enumerate() {
+        if !replaced[index] {
+            result.push(agent.clone());
+        }
+    }
+
+    result
+}
+
+// ══════════════════════════════════════════════════
+// Secret Prompting — 交互式补齐缺失的 API Key
+// ══════════════════════════════════════════════════
+
+fn resolve_apikey_interactive(source: &str) -> Result<String> {
+    match resolve_apikey(source) {
+        Ok(key) => Ok(key),
+        Err(e) => {
+            if let Some(service) = source.strip_prefix("keychain:") {
+                if !cfg!(target_os = "macos") {
+                    bail!("`keychain:` 仅支持 macOS Keychain，请改用 `env:` 或在 macOS 上运行。");
+                }
+                eprintln!("从 Keychain 读取 `{service}` 失败: {e}");
+                eprint!("请输入 {service} 的 API Key: ");
+
+                let mut input = String::new();
+                io::stdin().read_line(&mut input).context("读取输入失败")?;
+                let key = input.trim().to_string();
+
+                if key.is_empty() {
+                    bail!("API Key 不能为空");
+                }
+
+                let user = env::var("USER").unwrap_or_default();
+                let child = Command::new("security")
+                    .args([
+                        "add-generic-password",
+                        "-a",
+                        &user,
+                        "-s",
+                        service,
+                        "-w",
+                        &key,
+                        "-U",
+                    ])
+                    .spawn()
+                    .with_context(|| "写入 Keychain 失败")?;
+
+                let output = child
+                    .wait_with_output()
+                    .with_context(|| "等待 Keychain 写入完成失败")?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    bail!("写入 Keychain 失败: {}", stderr.trim());
+                }
+
+                eprintln!("已将 API Key 保存到 Keychain `{service}`。");
+                Ok(key)
+            } else if let Some(var) = source.strip_prefix("env:") {
+                bail!("环境变量 `{var}` 未设置，请通过 `export {var}=<your-key>` 设置后重试")
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 fn exec_launch(spec: LaunchSpec) -> Result<()> {
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
+    for name in &spec.env_remove {
+        command.env_remove(name);
+    }
     command.envs(&spec.env);
 
     if spec.detach {
@@ -1230,6 +1772,7 @@ struct LaunchSpec {
     env: BTreeMap<String, String>,
     summary: String,
     detach: bool,
+    env_remove: Vec<String>,
 }
 
 fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Result<LaunchSpec> {
@@ -1239,6 +1782,7 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
 
     let agent_id = &selection.agent_id;
     let provider = &selection.provider;
+    let mut env_remove = Vec::new();
 
     // Default provider (no endpoints) — use agent's own default behavior
     if !provider.has_endpoints {
@@ -1247,16 +1791,20 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
                 args.extend(passthrough_args.iter().cloned());
             }
             "claude" => {
+                env_remove.push("ANTHROPIC_API_KEY".into());
+                env_remove.push("ANTHROPIC_AUTH_TOKEN".into());
+                let mut settings_env = BTreeMap::new();
                 if let Some(ref source) = provider.apikey_source {
-                    let key = resolve_apikey(source)?;
-                    env.insert("ANTHROPIC_API_KEY".into(), key.clone());
-                    env.insert("ANTHROPIC_AUTH_TOKEN".into(), key);
+                    let key = resolve_apikey_interactive(source)?;
+                    settings_env.insert("ANTHROPIC_API_KEY".into(), key.clone());
+                    settings_env.insert("ANTHROPIC_AUTH_TOKEN".into(), key);
                 }
+                prepare_claude_launch_home(&settings_env, None, &mut env)?;
                 args.extend(passthrough_args.iter().cloned());
             }
             "codex" => {
                 if let Some(ref source) = provider.apikey_source {
-                    if let Ok(value) = resolve_apikey(source) {
+                    if let Ok(value) = resolve_apikey_interactive(source) {
                         env.insert("AZURE_OPENAI_API_KEY".into(), value);
                     }
                 }
@@ -1274,7 +1822,7 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
         ))?;
 
         let apikey = if let Some(ref source) = provider.apikey_source {
-            resolve_apikey(source)?
+            resolve_apikey_interactive(source)?
         } else {
             bail!(
                 "Provider `{}` 需要 API Key 但未配置 apikey_source",
@@ -1311,9 +1859,12 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
                 args.extend(passthrough_args.iter().cloned());
             }
             "claude" => {
-                env.insert("ANTHROPIC_BASE_URL".into(), model.endpoint_url.clone());
-                env.insert("ANTHROPIC_API_KEY".into(), apikey);
-                env.insert("ANTHROPIC_MODEL".into(), model.id.clone());
+                env_remove.push("ANTHROPIC_API_KEY".into());
+                env_remove.push("ANTHROPIC_AUTH_TOKEN".into());
+                let mut settings_env = BTreeMap::new();
+                settings_env.insert("ANTHROPIC_BASE_URL".into(), model.endpoint_url.clone());
+                settings_env.insert("ANTHROPIC_API_KEY".into(), apikey);
+                prepare_claude_launch_home(&settings_env, Some(&model.id), &mut env)?;
                 args.extend(passthrough_args.iter().cloned());
             }
             "codex" => {
@@ -1325,23 +1876,7 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
                     );
                 }
                 env.insert("DASHSCOPE_API_KEY".into(), apikey);
-                args.extend([
-                    "-c".to_string(),
-                    r#"model_providers.dashscope.name="DashScope""#.to_string(),
-                    "-c".to_string(),
-                    format!(
-                        r#"model_providers.dashscope.base_url="{}""#,
-                        model.endpoint_url
-                    ),
-                    "-c".to_string(),
-                    r#"model_providers.dashscope.env_key="DASHSCOPE_API_KEY""#.to_string(),
-                    "-c".to_string(),
-                    r#"model_providers.dashscope.wire_api="responses""#.to_string(),
-                    "-c".to_string(),
-                    r#"model_provider="dashscope""#.to_string(),
-                    "-c".to_string(),
-                    format!(r#"model="{}""#, model.id),
-                ]);
+                prepare_codex_launch_home(model, &mut env)?;
                 args.extend(passthrough_args.iter().cloned());
             }
             _ => {
@@ -1365,6 +1900,7 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
         env,
         summary,
         detach: false,
+        env_remove,
     })
 }
 
@@ -1403,6 +1939,10 @@ fn resolve_binary(name: &str) -> Result<PathBuf> {
 }
 
 fn keychain_secret(service: &str) -> Result<String> {
+    if !cfg!(target_os = "macos") {
+        bail!("`keychain:` 仅支持 macOS Keychain，请改用 `env:` 配置 `{service}`。");
+    }
+
     let user = env::var("USER").unwrap_or_default();
     let output = Command::new("security")
         .args(["find-generic-password", "-a", &user, "-s", service, "-w"])
@@ -1493,7 +2033,7 @@ fn run_probe(target_model: Option<String>, config: &CxConfig) -> Result<()> {
             "没有可探测的 Provider（需要至少一个带 API Key 的 responses/completions endpoint）",
         )?;
 
-    let apikey = resolve_apikey(probe_provider.apikey_source.as_ref().unwrap())?;
+    let apikey = resolve_apikey_interactive(probe_provider.apikey_source.as_ref().unwrap())?;
     let probe_base_url = &probe_endpoint.url;
 
     let client = reqwest::blocking::Client::builder()
@@ -2037,118 +2577,143 @@ fn current_prompt(state: &AppState) -> String {
 mod tests {
     use super::*;
 
-    fn test_config() -> CxConfig {
-        load_config().unwrap()
+    fn minimal_test_config() -> CxConfig {
+        CxConfig {
+            providers: vec![ProviderConfig {
+                name: "Test".into(),
+                apikey_source: Some("literal:test".into()),
+                agents: vec![],
+                models: BTreeMap::new(),
+                endpoints: BTreeMap::new(),
+            }],
+            agents: vec![
+                AgentConfig {
+                    id: "copilot".into(),
+                    binary: "copilot".into(),
+                    wire_apis: vec![],
+                },
+                AgentConfig {
+                    id: "claude".into(),
+                    binary: "claude".into(),
+                    wire_apis: vec![],
+                },
+                AgentConfig {
+                    id: "codex".into(),
+                    binary: "codex".into(),
+                    wire_apis: vec![],
+                },
+            ],
+        }
+    }
+
+    fn temp_test_dir(label: &str) -> PathBuf {
+        env::temp_dir().join(format!("cx-{label}-{}", random_urlsafe(6)))
+    }
+
+    fn create_fake_binary(name: &str) -> PathBuf {
+        let dir = temp_test_dir("fake-binary");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn test_resolved_model(model_id: &str, endpoint_url: &str, wire_api: WireApi) -> ResolvedModel {
+        ResolvedModel {
+            id: model_id.into(),
+            arena: "—".into(),
+            swe_p: "—".into(),
+            tb2: "—".into(),
+            desc: String::new(),
+            wire_api,
+            provider_name: "DashScope".into(),
+            endpoint_url: endpoint_url.into(),
+            visible_agents: vec!["codex".into(), "claude".into()],
+            copilot_auth: CopilotAuth::ApiKey,
+        }
+    }
+
+    // ── clap CLI parsing tests ──
+
+    fn parse(args: &[&str]) -> Option<CxCommand> {
+        Cli::try_parse_from(std::iter::once("cx").chain(args.iter().copied()))
+            .ok()
+            .and_then(|cli| cli.command)
     }
 
     #[test]
-    fn config_loads_successfully() {
-        let config = test_config();
-        assert!(!config.providers.is_empty());
-        assert!(!config.agents.is_empty());
+    fn clap_parse_login() {
+        assert_eq!(parse(&["login"]), Some(CxCommand::Login));
     }
 
     #[test]
-    fn parse_login_logout_and_whoami() {
-        let config = test_config();
+    fn clap_parse_logout() {
+        assert_eq!(parse(&["logout"]), Some(CxCommand::Logout));
+    }
+
+    #[test]
+    fn clap_parse_whoami() {
+        assert_eq!(parse(&["whoami"]), Some(CxCommand::Whoami));
+    }
+
+    #[test]
+    fn clap_parse_help() {
+        assert_eq!(parse(&["help"]), Some(CxCommand::Help));
+    }
+
+    #[test]
+    fn clap_parse_probe_no_model() {
+        assert_eq!(parse(&["probe"]), Some(CxCommand::Probe { model_id: None }));
+    }
+
+    #[test]
+    fn clap_parse_probe_with_model() {
         assert_eq!(
-            parse_invocation(vec!["login".into()], &config),
-            Invocation::Login
-        );
-        assert_eq!(
-            parse_invocation(vec!["logout".into()], &config),
-            Invocation::Logout
-        );
-        assert_eq!(
-            parse_invocation(vec!["whoami".into()], &config),
-            Invocation::Whoami
+            parse(&["probe", "qwen3.6-plus"]),
+            Some(CxCommand::Probe {
+                model_id: Some("qwen3.6-plus".into())
+            })
         );
     }
 
     #[test]
-    fn parse_no_args() {
-        let config = test_config();
+    fn clap_parse_patch_url() {
         assert_eq!(
-            parse_invocation(vec![], &config),
-            Invocation::Launch {
-                agent_hint: None,
-                passthrough_args: vec![],
-            }
+            parse(&["patch", "--url", "https://example.com/p.yaml"]),
+            Some(CxCommand::Patch {
+                url: Some("https://example.com/p.yaml".into()),
+                refresh: false
+            })
         );
     }
 
     #[test]
-    fn parse_agent_with_passthrough() {
-        let config = test_config();
+    fn clap_parse_patch_refresh() {
         assert_eq!(
-            parse_invocation(vec!["claude".into(), "mcp".into(), "list".into()], &config),
-            Invocation::Launch {
-                agent_hint: Some("claude".into()),
-                passthrough_args: vec!["mcp".into(), "list".into()],
-            }
+            parse(&["patch", "--refresh"]),
+            Some(CxCommand::Patch {
+                url: None,
+                refresh: true
+            })
         );
     }
 
     #[test]
-    fn parse_passthrough_without_agent_hint() {
-        let config = test_config();
-        assert_eq!(
-            parse_invocation(vec!["mcp".into(), "list".into()], &config),
-            Invocation::Launch {
-                agent_hint: None,
-                passthrough_args: vec!["mcp".into(), "list".into()],
-            }
-        );
+    fn clap_unknown_subcommand_falls_through() {
+        assert!(parse(&["claude", "mcp", "list"]).is_none());
+        assert!(parse(&["unknown-cmd"]).is_none());
     }
 
-    #[test]
-    fn parse_probe() {
-        let config = test_config();
-        assert_eq!(
-            parse_invocation(vec!["probe".into(), "glm-5".into()], &config),
-            Invocation::Probe {
-                target_model: Some("glm-5".into()),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_codex_app_is_rejected() {
-        let config = test_config();
-        let invocation = parse_invocation(vec!["codex".into(), "app".into(), ".".into()], &config);
-        assert!(
-            matches!(invocation, Invocation::Unsupported { .. }),
-            "expected codex app to be rejected, got {invocation:?}"
-        );
-    }
-
-    #[test]
-    fn parse_legacy_codex_app_alias_is_rejected() {
-        let config = test_config();
-        let invocation = parse_invocation(vec!["codex-app".into(), ".".into()], &config);
-        assert!(
-            matches!(invocation, Invocation::Unsupported { .. }),
-            "expected codex-app alias to be rejected, got {invocation:?}"
-        );
-    }
-
-    #[test]
-    fn parse_non_desktop_codex_subcommand_still_passes_through() {
-        let config = test_config();
-        assert_eq!(
-            parse_invocation(vec!["codex".into(), "exec".into(), "app".into()], &config),
-            Invocation::Launch {
-                agent_hint: Some("codex".into()),
-                passthrough_args: vec!["exec".into(), "app".into()],
-            }
-        );
-    }
+    // ── Launch spec tests ──
 
     #[test]
     fn codex_mcp_passthrough_stays_raw_without_endpoints() {
+        let fake_binary = create_fake_binary("codex");
         let selection = Selection {
             agent_id: "codex".into(),
-            agent_binary: "codex".into(),
+            agent_binary: fake_binary.display().to_string(),
             provider: ResolvedProvider {
                 name: "Codex Default".into(),
                 has_endpoints: false,
@@ -2159,14 +2724,45 @@ mod tests {
 
         let spec = build_launch_spec(&selection, &["mcp".into(), "serve".into()]).unwrap();
         assert_eq!(spec.args, vec!["mcp".to_string(), "serve".to_string()]);
-        assert!(!spec.args.iter().any(|arg| arg.starts_with("--cwd")));
+        let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
     }
 
     #[test]
-    fn codex_mcp_passthrough_never_injects_cwd_with_endpoint_provider() {
+    fn claude_launch_removes_anthropic_env_vars() {
+        let fake_binary = create_fake_binary("claude");
         let selection = Selection {
-            agent_id: "codex".into(),
-            agent_binary: "codex".into(),
+            agent_id: "claude".into(),
+            agent_binary: fake_binary.display().to_string(),
+            provider: ResolvedProvider {
+                name: "Test".into(),
+                has_endpoints: false,
+                apikey_source: Some("literal:test-key".into()),
+            },
+            model: None,
+        };
+        let spec = build_launch_spec(&selection, &[]).unwrap();
+        assert!(spec.env_remove.contains(&"ANTHROPIC_API_KEY".to_string()));
+        assert!(
+            spec.env_remove
+                .contains(&"ANTHROPIC_AUTH_TOKEN".to_string())
+        );
+        let fake_home = PathBuf::from(spec.env.get("HOME").unwrap());
+        let settings: Value = serde_json::from_str(
+            &fs::read_to_string(fake_home.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["env"]["ANTHROPIC_API_KEY"], "test-key");
+        assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "test-key");
+        let _ = fs::remove_dir_all(fake_home);
+        let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
+    }
+
+    #[test]
+    fn claude_with_endpoint_removes_anthropic_env_vars() {
+        let fake_binary = create_fake_binary("claude");
+        let selection = Selection {
+            agent_id: "claude".into(),
+            agent_binary: fake_binary.display().to_string(),
             provider: ResolvedProvider {
                 name: "DashScope".into(),
                 has_endpoints: true,
@@ -2178,203 +2774,337 @@ mod tests {
                 swe_p: "—".into(),
                 tb2: "—".into(),
                 desc: String::new(),
-                wire_api: WireApi::Responses,
-                provider_name: "DashScope".into(),
-                endpoint_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(),
-                visible_agents: vec!["codex".into()],
-                copilot_auth: CopilotAuth::ApiKey,
-            }),
-        };
-
-        let spec = build_launch_spec(&selection, &["mcp".into(), "list".into()]).unwrap();
-        assert_eq!(
-            spec.args,
-            vec![
-                "-c".to_string(),
-                r#"model_providers.dashscope.name="DashScope""#.to_string(),
-                "-c".to_string(),
-                r#"model_providers.dashscope.base_url="https://dashscope.aliyuncs.com/compatible-mode/v1""#
-                    .to_string(),
-                "-c".to_string(),
-                r#"model_providers.dashscope.env_key="DASHSCOPE_API_KEY""#.to_string(),
-                "-c".to_string(),
-                r#"model_providers.dashscope.wire_api="responses""#.to_string(),
-                "-c".to_string(),
-                r#"model_provider="dashscope""#.to_string(),
-                "-c".to_string(),
-                r#"model="qwen3.6-plus""#.to_string(),
-                "mcp".to_string(),
-                "list".to_string(),
-            ]
-        );
-        assert!(!spec.args.iter().any(|arg| arg.starts_with("--cwd")));
-    }
-
-    #[test]
-    fn codex_rejects_non_responses_endpoint_models() {
-        let selection = Selection {
-            agent_id: "codex".into(),
-            agent_binary: "codex".into(),
-            provider: ResolvedProvider {
-                name: "DashScope".into(),
-                has_endpoints: true,
-                apikey_source: Some("literal:test-key".into()),
-            },
-            model: Some(ResolvedModel {
-                id: "glm-5".into(),
-                arena: "—".into(),
-                swe_p: "—".into(),
-                tb2: "—".into(),
-                desc: String::new(),
-                wire_api: WireApi::Completions,
-                provider_name: "DashScope".into(),
-                endpoint_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(),
-                visible_agents: vec!["codex".into()],
-                copilot_auth: CopilotAuth::ApiKey,
-            }),
-        };
-
-        let error = build_launch_spec(&selection, &["mcp".into(), "list".into()]).unwrap_err();
-        assert!(error.to_string().contains("仅支持 responses endpoint 模型"));
-    }
-
-    #[test]
-    fn claude_dashscope_hides_minimax_m27() {
-        let config = test_config();
-        let all_models = build_all_models(&config);
-        let models = models_for_provider(&all_models, "claude", "百炼");
-        assert!(
-            models.iter().all(|model| model.id != "MiniMax-M2.7"),
-            "Claude should not offer MiniMax-M2.7 on DashScope"
-        );
-    }
-
-    #[test]
-    fn codex_dashscope_only_keeps_verified_responses_models() {
-        let config = test_config();
-        let all_models = build_all_models(&config);
-        let models = models_for_provider(&all_models, "codex", "百炼");
-        let mut ids = models
-            .iter()
-            .map(|model| model.id.as_str())
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        assert_eq!(
-            ids,
-            vec![
-                "qwen-plus-latest",
-                "qwen-turbo-latest",
-                "qwen3-coder-flash",
-                "qwen3-coder-plus",
-                "qwen3-max",
-                "qwen3.5-flash",
-                "qwen3.5-plus",
-                "qwen3.6-plus",
-            ],
-            "Codex should expose all verified DashScope responses-compatible models"
-        );
-    }
-
-    #[test]
-    fn copilot_prefers_anthropic_for_duplicate_models() {
-        let config = test_config();
-        let all_models = build_all_models(&config);
-        let models = models_for_provider(&all_models, "copilot", "Xiaomi MIMO (陈忠润)");
-        let mimo = models
-            .iter()
-            .find(|model| model.id == "mimo-v2.5-pro")
-            .expect("mimo-v2.5-pro should be visible to copilot");
-        assert_eq!(mimo.wire_api, WireApi::Anthropic);
-    }
-
-    #[test]
-    fn copilot_prefers_anthropic_for_dashscope_duplicates() {
-        let config = test_config();
-        let all_models = build_all_models(&config);
-        let models = models_for_provider(&all_models, "copilot", "百炼");
-        let qwen = models
-            .iter()
-            .find(|model| model.id == "qwen3-coder-flash")
-            .expect("qwen3-coder-flash should be visible to copilot");
-        assert_eq!(qwen.wire_api, WireApi::Anthropic);
-    }
-
-    #[test]
-    fn copilot_dashscope_hides_deepseek_v4_pro_1m() {
-        let config = test_config();
-        let all_models = build_all_models(&config);
-        let models = models_for_provider(&all_models, "copilot", "百炼");
-        assert!(
-            models.iter().all(|model| model.id != "deepseek-v4-pro[1m]"),
-            "copilot should not offer deepseek-v4-pro[1m] on DashScope"
-        );
-    }
-
-    #[test]
-    fn copilot_packy_provider_is_visible() {
-        let config = test_config();
-        let providers = providers_for_agent(&config, "copilot");
-        assert!(
-            providers
-                .iter()
-                .any(|provider| provider.name == "Packy API")
-        );
-    }
-
-    #[test]
-    fn codex_does_not_see_packy_provider() {
-        let config = test_config();
-        let providers = providers_for_agent(&config, "codex");
-        assert!(
-            providers
-                .iter()
-                .all(|provider| provider.name != "Packy API")
-        );
-    }
-
-    #[test]
-    fn copilot_mimo_anthropic_uses_bearer_token() {
-        let selection = Selection {
-            agent_id: "copilot".into(),
-            agent_binary: "copilot".into(),
-            provider: ResolvedProvider {
-                name: "Xiaomi MIMO (陈忠润)".into(),
-                has_endpoints: true,
-                apikey_source: Some("literal:test-key".into()),
-            },
-            model: Some(ResolvedModel {
-                id: "mimo-v2.5-pro".into(),
-                arena: "—".into(),
-                swe_p: "—".into(),
-                tb2: "—".into(),
-                desc: String::new(),
                 wire_api: WireApi::Anthropic,
-                provider_name: "Xiaomi MIMO (陈忠润)".into(),
-                endpoint_url: "https://token-plan-cn.xiaomimimo.com/anthropic".into(),
-                visible_agents: vec!["copilot".into(), "claude".into()],
-                copilot_auth: CopilotAuth::BearerToken,
+                provider_name: "DashScope".into(),
+                endpoint_url: "https://dashscope.aliyuncs.com/apps/anthropic".into(),
+                visible_agents: vec!["claude".into()],
+                copilot_auth: CopilotAuth::ApiKey,
             }),
         };
+        let spec = build_launch_spec(&selection, &[]).unwrap();
+        assert!(spec.env_remove.contains(&"ANTHROPIC_API_KEY".to_string()));
+        assert!(
+            spec.env_remove
+                .contains(&"ANTHROPIC_AUTH_TOKEN".to_string())
+        );
+        let fake_home = PathBuf::from(spec.env.get("HOME").unwrap());
+        let settings: Value = serde_json::from_str(
+            &fs::read_to_string(fake_home.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            "https://dashscope.aliyuncs.com/apps/anthropic"
+        );
+        assert_eq!(settings["env"]["ANTHROPIC_API_KEY"], "test-key");
+        assert_eq!(settings["model"], "qwen3.6-plus");
+        let _ = fs::remove_dir_all(fake_home);
+        let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
+    }
 
-        let spec =
-            build_launch_spec(&selection, &["-p".into(), "Reply with exactly OK.".into()]).unwrap();
-        assert_eq!(
-            spec.env.get("COPILOT_PROVIDER_TYPE").map(String::as_str),
-            Some("anthropic")
+    // ── Merge tests ──
+
+    #[test]
+    fn merge_providers_replaces_by_name() {
+        let existing = vec![ProviderConfig {
+            name: "A".into(),
+            apikey_source: Some("literal:old".into()),
+            agents: vec![],
+            models: BTreeMap::new(),
+            endpoints: BTreeMap::new(),
+        }];
+        let incoming = vec![ProviderConfig {
+            name: "A".into(),
+            apikey_source: Some("literal:new".into()),
+            agents: vec![],
+            models: BTreeMap::new(),
+            endpoints: BTreeMap::new(),
+        }];
+        let merged = merge_providers(&existing, &incoming);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].apikey_source.as_deref(), Some("literal:new"));
+    }
+
+    #[test]
+    fn merge_providers_appends_new() {
+        let existing = vec![ProviderConfig {
+            name: "A".into(),
+            apikey_source: None,
+            agents: vec![],
+            models: BTreeMap::new(),
+            endpoints: BTreeMap::new(),
+        }];
+        let incoming = vec![ProviderConfig {
+            name: "B".into(),
+            apikey_source: None,
+            agents: vec![],
+            models: BTreeMap::new(),
+            endpoints: BTreeMap::new(),
+        }];
+        let merged = merge_providers(&existing, &incoming);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_providers_preserves_order_for_replacements() {
+        let existing = vec![
+            ProviderConfig {
+                name: "A".into(),
+                apikey_source: Some("literal:a".into()),
+                agents: vec![],
+                models: BTreeMap::new(),
+                endpoints: BTreeMap::new(),
+            },
+            ProviderConfig {
+                name: "B".into(),
+                apikey_source: Some("literal:old".into()),
+                agents: vec![],
+                models: BTreeMap::new(),
+                endpoints: BTreeMap::new(),
+            },
+            ProviderConfig {
+                name: "C".into(),
+                apikey_source: Some("literal:c".into()),
+                agents: vec![],
+                models: BTreeMap::new(),
+                endpoints: BTreeMap::new(),
+            },
+        ];
+        let incoming = vec![
+            ProviderConfig {
+                name: "B".into(),
+                apikey_source: Some("literal:new".into()),
+                agents: vec![],
+                models: BTreeMap::new(),
+                endpoints: BTreeMap::new(),
+            },
+            ProviderConfig {
+                name: "D".into(),
+                apikey_source: Some("literal:d".into()),
+                agents: vec![],
+                models: BTreeMap::new(),
+                endpoints: BTreeMap::new(),
+            },
+        ];
+
+        let merged = merge_providers(&existing, &incoming);
+        let names: Vec<&str> = merged
+            .iter()
+            .map(|provider| provider.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["A", "B", "C", "D"]);
+        assert_eq!(merged[1].apikey_source.as_deref(), Some("literal:new"));
+    }
+
+    #[test]
+    fn merge_agents_replaces_by_id() {
+        let existing = vec![AgentConfig {
+            id: "claude".into(),
+            binary: "claude-old".into(),
+            wire_apis: vec![],
+        }];
+        let incoming = vec![AgentConfig {
+            id: "claude".into(),
+            binary: "claude-new".into(),
+            wire_apis: vec![],
+        }];
+        let merged = merge_agents(&existing, &incoming);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].binary, "claude-new");
+    }
+
+    #[test]
+    fn merge_agents_appends_new() {
+        let existing = vec![AgentConfig {
+            id: "copilot".into(),
+            binary: "copilot".into(),
+            wire_apis: vec![],
+        }];
+        let incoming = vec![AgentConfig {
+            id: "codex".into(),
+            binary: "codex".into(),
+            wire_apis: vec![],
+        }];
+        let merged = merge_agents(&existing, &incoming);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_agents_preserves_order_for_replacements() {
+        let existing = vec![
+            AgentConfig {
+                id: "copilot".into(),
+                binary: "copilot".into(),
+                wire_apis: vec![],
+            },
+            AgentConfig {
+                id: "claude".into(),
+                binary: "claude-old".into(),
+                wire_apis: vec![],
+            },
+            AgentConfig {
+                id: "codex".into(),
+                binary: "codex".into(),
+                wire_apis: vec![],
+            },
+        ];
+        let incoming = vec![
+            AgentConfig {
+                id: "claude".into(),
+                binary: "claude-new".into(),
+                wire_apis: vec![],
+            },
+            AgentConfig {
+                id: "gemini".into(),
+                binary: "gemini".into(),
+                wire_apis: vec![],
+            },
+        ];
+
+        let merged = merge_agents(&existing, &incoming);
+        let ids: Vec<&str> = merged.iter().map(|agent| agent.id.as_str()).collect();
+        assert_eq!(ids, vec!["copilot", "claude", "codex", "gemini"]);
+        assert_eq!(merged[1].binary, "claude-new");
+    }
+
+    #[test]
+    fn merge_codex_config_rewrites_provider_and_project_section() {
+        let existing = r#"
+model = "old-model"
+model_provider = "old-provider"
+approval_policy = "on-request"
+
+[model_providers.dashscope]
+name = "Old"
+base_url = "https://old.example.com"
+env_key = "OLD_KEY"
+wire_api = "responses"
+
+[projects."/tmp/workspace"]
+trust_level = "untrusted"
+
+[projects."/tmp/other"]
+trust_level = "trusted"
+"#;
+
+        let merged = merge_codex_config(
+            Some(existing),
+            &test_resolved_model(
+                "qwen3.6-plus",
+                "https://dashscope.aliyuncs.com/v1",
+                WireApi::Responses,
+            ),
+            Path::new("/tmp/workspace"),
+        )
+        .unwrap();
+
+        assert!(merged.contains(r#"model = "qwen3.6-plus""#));
+        assert!(merged.contains(r#"base_url = "https://dashscope.aliyuncs.com/v1""#));
+        assert!(merged.contains(r#"[projects."/tmp/workspace"]"#));
+        assert!(merged.contains(r#"trust_level = "trusted""#));
+        assert!(merged.contains(r#"approval_policy = "on-request""#));
+        assert!(merged.contains(r#"[projects."/tmp/other"]"#));
+        assert!(!merged.contains("https://old.example.com"));
+    }
+
+    #[test]
+    fn merge_claude_settings_preserves_existing_keys_and_overrides_env() {
+        let existing = r#"{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "model": "opus[1m]",
+  "theme": "light"
+}"#;
+        let mut env_overrides = BTreeMap::new();
+        env_overrides.insert(
+            "ANTHROPIC_BASE_URL".into(),
+            "https://dashscope.aliyuncs.com/apps/anthropic".into(),
         );
+        env_overrides.insert("ANTHROPIC_API_KEY".into(), "test-key".into());
+
+        let merged =
+            merge_claude_settings(Some(existing), &env_overrides, Some("qwen3.6-plus")).unwrap();
+        let merged: Value = serde_json::from_str(&merged).unwrap();
+
+        assert_eq!(merged["theme"], "light");
+        assert_eq!(merged["model"], "qwen3.6-plus");
+        assert_eq!(merged["env"]["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"], "1");
         assert_eq!(
-            spec.env
-                .get("COPILOT_PROVIDER_BEARER_TOKEN")
-                .map(String::as_str),
-            Some("test-key")
+            merged["env"]["ANTHROPIC_BASE_URL"],
+            "https://dashscope.aliyuncs.com/apps/anthropic"
         );
-        assert!(!spec.env.contains_key("COPILOT_PROVIDER_API_KEY"));
+        assert_eq!(merged["env"]["ANTHROPIC_API_KEY"], "test-key");
+    }
+
+    #[test]
+    fn materialize_passthrough_dir_skips_overridden_entries() {
+        let root = temp_test_dir("passthrough-dir");
+        let real = root.join("real");
+        let fake = root.join("fake");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("keep.txt"), "ok").unwrap();
+        fs::write(real.join("override.txt"), "skip").unwrap();
+
+        materialize_passthrough_dir(&real, &fake, &["override.txt"]).unwrap();
+
+        assert!(fake.join("keep.txt").exists());
+        assert!(!fake.join("override.txt").exists());
+        #[cfg(unix)]
+        assert!(
+            fs::symlink_metadata(fake.join("keep.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrate_legacy_provider_config_moves_file() {
+        let dir = temp_test_dir("provider-config-migration");
+        fs::create_dir_all(&dir).unwrap();
+
+        let current_path = dir.join(PROVIDER_CONFIG_FILE_NAME);
+        let legacy_path = dir.join(LEGACY_PROVIDER_CONFIG_FILE_NAME);
+        let content = "providers: []\nagents: []\n";
+        fs::write(&legacy_path, content).unwrap();
+
+        let migrated = migrate_legacy_provider_config(&current_path, &legacy_path).unwrap();
+        assert!(migrated);
+        assert!(!legacy_path.exists());
+        assert_eq!(fs::read_to_string(&current_path).unwrap(), content);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolved_agents_hide_legacy_codex_app_entry() {
+        let config = CxConfig {
+            providers: vec![],
+            agents: vec![
+                AgentConfig {
+                    id: "codex".into(),
+                    binary: "codex".into(),
+                    wire_apis: vec![],
+                },
+                AgentConfig {
+                    id: "codex-app".into(),
+                    binary: "codex-app".into(),
+                    wire_apis: vec![],
+                },
+            ],
+        };
+        let agents = resolved_agents(&config);
+        assert_eq!(agents.iter().filter(|agent| agent.id == "codex").count(), 1);
+        assert!(agents.iter().all(|agent| agent.id != "codex-app"));
     }
 
     #[test]
     fn provider_lists_end_with_add_provider() {
-        let config = test_config();
-        for agent in &config.agents {
+        let config = minimal_test_config();
+        for agent in resolved_agents(&config) {
             let providers = providers_for_agent(&config, &agent.id);
             assert_eq!(
                 providers.last().map(|p| p.name.as_str()),
@@ -2384,61 +3114,10 @@ mod tests {
     }
 
     #[test]
-    fn copilot_only_sees_copilot_providers() {
-        let config = test_config();
-        let providers = providers_for_agent(&config, "copilot");
-        assert!(providers.iter().any(|p| p.name == "百炼"));
-        assert!(providers.iter().any(|p| p.name == "GitHub Copilot Plan"));
-        assert!(providers.iter().any(|p| p.name == "Packy API"));
-        assert!(providers.iter().any(|p| p.name == "Xiaomi MIMO (陈忠润)"));
-    }
-
-    #[test]
-    fn resolved_agents_hide_legacy_codex_app_entry() {
-        let config = test_config();
-        let agents = resolved_agents(&config);
-        assert_eq!(agents.iter().filter(|agent| agent.id == "codex").count(), 1);
-        assert!(agents.iter().all(|agent| agent.id != "codex-app"));
-    }
-
-    #[test]
-    fn codex_alias_and_native_agent_see_same_providers() {
-        let config = test_config();
-        let codex = providers_for_agent(&config, "codex");
-        let legacy = providers_for_agent(&config, "codex-app");
-        assert_eq!(
-            codex
-                .iter()
-                .map(|provider| provider.name.clone())
-                .collect::<Vec<_>>(),
-            legacy
-                .iter()
-                .map(|provider| provider.name.clone())
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn codex_alias_and_native_agent_see_same_models() {
-        let config = test_config();
-        let all_models = build_all_models(&config);
-        let codex = models_for_provider(&all_models, "codex", "百炼");
-        let legacy = models_for_provider(&all_models, "codex-app", "百炼");
-        assert_eq!(
-            codex
-                .iter()
-                .map(|model| model.id.clone())
-                .collect::<Vec<_>>(),
-            legacy
-                .iter()
-                .map(|model| model.id.clone())
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
     fn resolve_binary_finds_codex_cli() {
-        let path = resolve_binary("codex").unwrap();
-        assert!(path.ends_with("codex"));
+        let fake_binary = create_fake_binary("codex");
+        let path = resolve_binary(&fake_binary.display().to_string()).unwrap();
+        assert_eq!(path, fake_binary);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }
