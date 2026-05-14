@@ -1503,6 +1503,7 @@ fn run_launcher(
     println!("{}", spec.summary);
     println!();
 
+    apply_selected_model_tab_name(&selection)?;
     exec_launch(spec)
 }
 
@@ -1515,6 +1516,30 @@ fn print_add_provider_guide(agent_id: &str) {
     println!("3. 仓库中的 `config/providers.default.yaml` 可作为基线示例。");
     println!("4. 配置格式参考: docs/cx-config-schema.yaml");
     println!();
+}
+
+fn apply_selected_model_tab_name(selection: &Selection) -> Result<()> {
+    let Some(model_id) = selection
+        .model
+        .as_ref()
+        .map(|model| sanitize_terminal_title(&model.id))
+    else {
+        return Ok(());
+    };
+
+    if model_id.is_empty() {
+        return Ok(());
+    }
+
+    let mut stdout = io::stdout();
+    write!(stdout, "\x1b]1;{model_id}\x07\x1b]2;{model_id}\x07")
+        .context("设置终端 tab 名称失败")?;
+    stdout.flush().context("刷新终端 title 失败")?;
+    Ok(())
+}
+
+fn sanitize_terminal_title(title: &str) -> String {
+    title.chars().filter(|ch| !ch.is_ascii_control()).collect()
 }
 
 fn print_help() {
@@ -2800,6 +2825,30 @@ mod tests {
         assert_eq!(settings["model"], "qwen3.6-plus");
         let _ = fs::remove_dir_all(fake_home);
         let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
+    }
+
+    #[test]
+    fn sanitize_terminal_title_strips_control_chars() {
+        assert_eq!(
+            sanitize_terminal_title("gpt-5.4\x1b]2;ignored\x07\n"),
+            "gpt-5.4]2;ignored"
+        );
+    }
+
+    #[test]
+    fn apply_selected_model_tab_name_skips_missing_model() {
+        let selection = Selection {
+            agent_id: "codex".into(),
+            agent_binary: "codex".into(),
+            provider: ResolvedProvider {
+                name: "Default".into(),
+                has_endpoints: false,
+                apikey_source: None,
+            },
+            model: None,
+        };
+
+        assert!(apply_selected_model_tab_name(&selection).is_ok());
     }
 
     // ── Merge tests ──
