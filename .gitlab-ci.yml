@@ -69,8 +69,23 @@ build:linux-x86_64:
       fi
       echo "Detected MacOSX SDK at: ${SDK_CANDIDATE}"
       export SDKROOT="${SDK_CANDIDATE}"
+    - |
+      case "${CARGO_BUILD_TARGET}" in
+        aarch64-apple-darwin) CROSS_CC=oa64-clang ;;
+        x86_64-apple-darwin)  CROSS_CC=o64-clang  ;;
+        *) echo "FATAL: unsupported target ${CARGO_BUILD_TARGET}" >&2; exit 1 ;;
+      esac
+      if ! command -v "${CROSS_CC}" >/dev/null 2>&1; then
+        echo "FATAL: ${CROSS_CC} not on PATH; image layout may have changed." >&2
+        exit 1
+      fi
+      TARGET_UPPER="$(printf '%s' "${CARGO_BUILD_TARGET}" | tr 'a-z-' 'A-Z_')"
+      ENV_TARGET="$(printf '%s' "${CARGO_BUILD_TARGET}" | tr '-' '_')"
+      export "CARGO_TARGET_${TARGET_UPPER}_LINKER=${CROSS_CC}"
+      export "CC_${ENV_TARGET}=${CROSS_CC}"
+      export "CXX_${ENV_TARGET}=${CROSS_CC}++"
   script:
-    - cargo zigbuild --release --target ${CARGO_BUILD_TARGET}
+    - cargo build --release --target ${CARGO_BUILD_TARGET}
     - mkdir -p dist
     - cp target/${CARGO_BUILD_TARGET}/release/cx dist/cx-${ARTIFACT_SUFFIX}
   artifacts:
