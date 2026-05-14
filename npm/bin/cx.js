@@ -10,7 +10,6 @@ const pkg = require('../package.json');
 
 const baseUrl = process.env.CX_GITLAB_BASE_URL || 'https://git.huayi.tech';
 const projectPath = process.env.CX_GITLAB_PROJECT_PATH || 'awesome/cx';
-const token = process.env.CX_GITLAB_TOKEN || process.env.GITLAB_TOKEN;
 
 function detectAssetName() {
   const platformMap = {
@@ -30,9 +29,12 @@ function detectAssetName() {
   return `cx-${osName}-${arch}`;
 }
 
+function normalizeTag(version) {
+  return version.startsWith('v') ? version : `v${version}`;
+}
+
 async function download(url, destination) {
-  const headers = token ? { 'PRIVATE-TOKEN': token } : {};
-  const response = await fetch(url, { headers, redirect: 'follow' });
+  const response = await fetch(url, { redirect: 'follow' });
   if (!response.ok) {
     throw new Error(`Download failed (${response.status}) for ${url}`);
   }
@@ -60,17 +62,14 @@ function verifyChecksum(checksumFile, binaryFile, assetName) {
 }
 
 async function ensureBinary() {
-  if (!token) {
-    throw new Error('Missing CX_GITLAB_TOKEN or GITLAB_TOKEN for private GitLab release download');
-  }
-
   const assetName = detectAssetName();
   const cacheRoot =
     process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');
-  const installDir = path.join(cacheRoot, 'cx-internal', pkg.version);
+  const releaseTag = normalizeTag(process.env.CX_VERSION || pkg.version);
+  const installDir = path.join(cacheRoot, 'cx-internal', releaseTag);
   const binaryPath = path.join(installDir, 'cx');
   const checksumPath = path.join(installDir, 'SHA256SUMS');
-  const releaseBase = `${baseUrl}/${projectPath}/-/releases/v${pkg.version}/downloads`;
+  const releaseBase = `${baseUrl}/${projectPath}/-/releases/${releaseTag}/downloads`;
 
   try {
     if (!fs.existsSync(binaryPath) || !fs.existsSync(checksumPath)) {

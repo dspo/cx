@@ -5,8 +5,8 @@ This edition is designed for GitLab-hosted internal distribution:
 
 - provider/model config lives in runtime YAML files
 - normal usage is gated by GitLab login
-- GitLab CI builds and publishes release assets
-- GitLab Release install script is the primary installation path
+- GitLab CI builds and publishes both rolling main artifacts and tag release assets
+- the rolling GitLab install script is the primary installation path
 - npm/npx is provided as a secondary GitLab-based distribution path
 
 ## Runtime model
@@ -29,31 +29,54 @@ cx logout
 `cx login` uses GitLab OAuth Authorization Code + PKCE against `https://git.huayi.tech`
 with callback `http://127.0.0.1:38081/callback`.
 
-## Install from GitLab Release
+## Install from GitLab
 
 This is the primary installation path for internal users.
 
 ```bash
-export CX_GITLAB_TOKEN=<gitlab-personal-access-token>
 curl -fsSL \
-  -H "PRIVATE-TOKEN: ${CX_GITLAB_TOKEN}" \
-  "https://git.huayi.tech/awesome/cx/-/releases/permalink/latest/downloads/install.sh" | sh
+  "https://git.huayi.tech/awesome/cx/-/jobs/artifacts/main/raw/dist/install.sh?job=publish-main" | sh
 ```
 
-The script downloads the latest matching release asset, verifies `SHA256SUMS`,
-and installs `cx` to `~/.local/bin/cx` by default.
+By default this installs the latest successful `main` build for the matching
+platform, verifies `SHA256SUMS`, and writes `cx` to `~/.local/bin/cx`.
+
+To install the latest stable release instead:
+
+```bash
+curl -fsSL \
+  "https://git.huayi.tech/awesome/cx/-/jobs/artifacts/main/raw/dist/install.sh?job=publish-main" | \
+  CX_CHANNEL=release sh
+```
+
+To install a specific release tag:
+
+```bash
+curl -fsSL \
+  "https://git.huayi.tech/awesome/cx/-/jobs/artifacts/main/raw/dist/install.sh?job=publish-main" | \
+  CX_CHANNEL=release CX_VERSION=v0.1.0 sh
+```
+
+The installer currently supports:
+
+- `cx-linux-x86_64`
+- `cx-linux-arm64`
+- `cx-darwin-arm64`
+- `cx-darwin-x86_64`
+
+If `~/.local/bin` is not already in `PATH`, the installer prints the export line
+to add before invoking `cx`.
 
 ## Install with npx
 
-`npx` is available as a secondary GitLab-based path. Because the project and
-release assets are private, users must configure npm registry auth and provide a
-GitLab token for the wrapper to download the native binary.
+`npx` is available as a secondary GitLab-based path. If your environment can
+reach the GitLab npm registry directly, install the wrapper and then let it
+download the matching release binary.
 
 ```bash
 npm config set @awesome:registry https://git.huayi.tech/api/v4/projects/<project-id>/packages/npm/
 npm config set -- //git.huayi.tech/api/v4/projects/<project-id>/packages/npm/:_authToken=<gitlab-token>
 
-export CX_GITLAB_TOKEN=<gitlab-personal-access-token>
 npx @awesome/cx login
 ```
 
@@ -93,10 +116,10 @@ responses provider are exposed in the published baseline config.
 
 1. `cargo fmt --check`
 2. `cargo test`
-3. Linux runner builds both `cx-linux-x86_64` and `cx-darwin-arm64` (the darwin build uses `cargo-zigbuild`)
-4. upload to GitLab Generic Package Registry
-5. GitLab Release creation with permanent asset links using the built-in `CI_JOB_TOKEN`
-6. npm package publish to the GitLab npm registry
+3. build jobs for `cx-linux-x86_64`, `cx-linux-arm64`, `cx-darwin-arm64`, and `cx-darwin-x86_64`
+4. a `publish-main` job whose raw artifacts provide a stable installer + checksum + binary URL for the latest successful `main` pipeline
+5. tag pipelines upload versioned assets to the GitLab Generic Package Registry and create a GitLab Release with permanent asset links
+6. tag pipelines publish the npm wrapper to the GitLab npm registry
 
 ## Local development
 
