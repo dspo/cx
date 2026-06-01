@@ -506,7 +506,8 @@ fn chart_date_range(
     records: &[&UsageRecord],
 ) -> Option<(String, String)> {
     match period {
-        Period::Today | Period::Last24Hours => Some((today.to_string(), today.to_string())),
+        Period::Today => Some((today.to_string(), today.to_string())),
+        Period::Last24Hours => Some((date_offset(today, -1).ok()?, today.to_string())),
         Period::Last7 => Some((date_offset(today, -6).ok()?, today.to_string())),
         Period::Last30 => {
             let days = super::date::previous_month_days(today) as i64;

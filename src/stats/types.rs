@@ -101,7 +101,7 @@ impl Period {
             Period::All => true,
             Period::Today => date == today,
             Period::Last24Hours => {
-                super::date::days_diff(date, today).is_some_and(|d| (0..1).contains(&d))
+                super::date::days_diff(date, today).is_some_and(|d| (0..2).contains(&d))
             }
             Period::Last7 => {
                 super::date::days_diff(date, today).is_some_and(|d| (0..7).contains(&d))
@@ -128,5 +128,20 @@ mod tests {
         assert!(Period::Last30.includes("2026-04-30", "2026-05-29"));
         assert!(!Period::Last30.includes("2026-04-29", "2026-05-29"));
         assert!(!Period::Last30.includes("2026-05-30", "2026-05-29"));
+    }
+
+    #[test]
+    fn today_only_includes_today() {
+        assert!(Period::Today.includes("2026-05-29", "2026-05-29"));
+        assert!(!Period::Today.includes("2026-05-28", "2026-05-29"));
+        assert!(!Period::Today.includes("2026-05-30", "2026-05-29"));
+    }
+
+    #[test]
+    fn last_24_hours_includes_today_and_yesterday() {
+        assert!(Period::Last24Hours.includes("2026-05-29", "2026-05-29"));
+        assert!(Period::Last24Hours.includes("2026-05-28", "2026-05-29"));
+        assert!(!Period::Last24Hours.includes("2026-05-27", "2026-05-29"));
+        assert!(!Period::Last24Hours.includes("2026-05-30", "2026-05-29"));
     }
 }
