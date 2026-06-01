@@ -66,22 +66,31 @@ impl ScanCache {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Period {
     All,
+    Today,
+    Last24Hours,
     Last7,
     Last30,
 }
 
 impl Period {
-    pub(super) fn label(self) -> &'static str {
+    pub(super) fn label(self, today: &str) -> String {
         match self {
-            Period::All => "All time",
-            Period::Last7 => "Last 7 days",
-            Period::Last30 => "Last 30 days",
+            Period::All => "All time".to_string(),
+            Period::Today => "Today".to_string(),
+            Period::Last24Hours => "Last 24 hours".to_string(),
+            Period::Last7 => "Last 7 days".to_string(),
+            Period::Last30 => {
+                let days = super::date::previous_month_days(today);
+                format!("Last {days} days")
+            }
         }
     }
 
     pub(super) fn cycle(self) -> Self {
         match self {
-            Period::All => Period::Last7,
+            Period::All => Period::Today,
+            Period::Today => Period::Last24Hours,
+            Period::Last24Hours => Period::Last7,
             Period::Last7 => Period::Last30,
             Period::Last30 => Period::All,
         }
@@ -90,11 +99,16 @@ impl Period {
     pub(super) fn includes(self, date: &str, today: &str) -> bool {
         match self {
             Period::All => true,
+            Period::Today => date == today,
+            Period::Last24Hours => {
+                super::date::days_diff(date, today).is_some_and(|d| (0..1).contains(&d))
+            }
             Period::Last7 => {
                 super::date::days_diff(date, today).is_some_and(|d| (0..7).contains(&d))
             }
             Period::Last30 => {
-                super::date::days_diff(date, today).is_some_and(|d| (0..30).contains(&d))
+                let days = super::date::previous_month_days(today) as i64;
+                super::date::days_diff(date, today).is_some_and(|d| (0..days).contains(&d))
             }
         }
     }

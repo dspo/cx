@@ -75,3 +75,26 @@ pub(super) fn days_diff(date: &str, today: &str) -> Option<i64> {
     let (y2, m2, d2) = parse_ymd(date)?;
     Some(days_from_civil(y1, m1, d1) - days_from_civil(y2, m2, d2))
 }
+
+/// 计算上个月有多少天（根据今天的日期）。
+/// 例如今天是 2026-06-01，则返回 5 月的天数 31。
+pub(super) fn previous_month_days(today: &str) -> i64 {
+    let Some((year, month, _)) = parse_ymd(today) else {
+        return 30;
+    };
+    let prev_year = if month == 1 { year - 1 } else { year };
+    let prev_month = if month == 1 { 12 } else { month - 1 };
+    let days = match prev_month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (prev_year % 4 == 0 && prev_year % 100 != 0) || (prev_year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    };
+    days
+}
