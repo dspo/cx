@@ -1445,13 +1445,10 @@ fn model_table_widths(
 ) -> Vec<Constraint> {
     let total_width = usage_column_width("Total", sorted.iter().map(|(_, usage)| usage));
 
-    // Model column must fit the longest model name.
-    let max_model_name_width = sorted
-        .iter()
-        .map(|(model, _)| text_width(model))
-        .max()
-        .unwrap_or(MODEL_MIN_WIDTH);
-    let model_width = max_model_name_width.max(MODEL_MIN_WIDTH);
+    // Model column: MODEL_MIN_WIDTH is the cap. Names longer than this (e.g.
+    // copilot-suggestions-himalia-001) are truncated — the column only needs to
+    // fit claude-haiku-4-5-20251001 (26 chars).
+    let model_width = MODEL_MIN_WIDTH;
 
     let column_count = (3 + agent_columns.len()) as u16;
     let inner_width = area_width.saturating_sub(2);
@@ -2004,8 +2001,8 @@ mod tests {
 
         let widths = model_table_widths(103, &sorted, &cells, &agent_columns);
 
-        // Model column: Min constraint, at least MODEL_MIN_WIDTH or longest model name
-        assert!(constraint_length(widths[0]) >= MODEL_MIN_WIDTH);
+        // Model column: Min constraint, capped at MODEL_MIN_WIDTH (26)
+        assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
         assert_eq!(constraint_length(widths[1]), SHARE_WIDTH);
         assert_eq!(constraint_length(widths[2]), text_width("↑174.4m ↓547.9k"));
         assert_eq!(constraint_length(widths[5]), text_width("Codex"));
@@ -2013,7 +2010,8 @@ mod tests {
     }
 
     #[test]
-    fn model_table_model_column_never_truncates_long_names() {
+    fn model_table_model_column_capped_at_min_width() {
+        // 26-char model name fits within MODEL_MIN_WIDTH
         let sorted = vec![
             ("claude-haiku-4-5-20251001".to_string(), usage(100, 0)),
             ("short".to_string(), usage(50, 0)),
@@ -2022,9 +2020,14 @@ mod tests {
         let agent_columns: Vec<(&str, &str)> = vec![];
 
         let widths = model_table_widths(60, &sorted, &cells, &agent_columns);
+        assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
 
-        // Model column must fit the longest name (26 chars)
-        assert!(constraint_length(widths[0]) >= 26);
+        // 30-char model name still capped at MODEL_MIN_WIDTH, not expanded
+        let longer_sorted = vec![
+            ("copilot-suggestions-himalia-001".to_string(), usage(100, 0)),
+        ];
+        let widths = model_table_widths(60, &longer_sorted, &cells, &agent_columns);
+        assert_eq!(constraint_length(widths[0]), MODEL_MIN_WIDTH);
     }
 
     #[test]
