@@ -17,7 +17,7 @@ use super::{MATRIX_AGENTS, PALETTE};
 type ChartSeries = (String, Vec<f64>, Color);
 type ChartOccupancy = HashSet<(u16, u16)>;
 
-const MODEL_MIN_WIDTH: u16 = 18;
+const MODEL_MIN_WIDTH: u16 = 26;
 const SHARE_WIDTH: u16 = 6;
 const TABLE_COLUMN_SPACING: u16 = 1;
 const STRIPED_ROW_BG: Color = Color::Rgb(238, 242, 247);
@@ -314,7 +314,7 @@ fn draw_race_frame(
         .map(|entry| text_width(&entry.model))
         .max()
         .unwrap_or(10)
-        .clamp(10, 22);
+        .clamp(10, 26);
     let value_width = current
         .entries
         .iter()
@@ -1966,7 +1966,7 @@ mod tests {
 
         let widths = model_table_widths(103, &sorted, &cells, &agent_columns);
 
-        assert!(constraint_length(widths[0]) >= 20);
+        assert!(constraint_length(widths[0]) >= 26);
         assert_eq!(constraint_length(widths[1]), SHARE_WIDTH);
         assert_eq!(constraint_length(widths[2]), text_width("↑174.4m ↓547.9k"));
         assert_eq!(constraint_length(widths[5]), text_width("Codex"));
