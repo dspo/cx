@@ -192,7 +192,11 @@ pub fn run_stats() -> Result<()> {
     // OMP (Oh My Pi) — 从 SQLite 数据库读取已聚合的用量数据。
     if let Some(home) = home_dir() {
         let omp_db = home.join(".omp/stats.db");
-        if omp_db.exists() {
+        // 跳过空文件：rusqlite 在 0 字节文件上可能创建 header，
+        // 干扰 OMP 自身的写入，且空文件无数据可读。
+        if omp_db.exists()
+            && fs::metadata(&omp_db).map(|m| m.len() > 0).unwrap_or(false)
+        {
             all_raw.extend(parser::omp::parse_omp_db(&omp_db));
         }
     }
