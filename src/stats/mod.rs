@@ -36,11 +36,13 @@ pub(crate) const AGENT_CLAUDE: &str = "claude";
 pub(crate) const AGENT_CODEX: &str = "codex";
 pub(crate) const AGENT_ZED: &str = "zed";
 pub(crate) const AGENT_COPILOT: &str = "copilot";
+pub(crate) const AGENT_OMP: &str = "omp";
 
 pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_CLAUDE, "Claude Code"),
     (AGENT_CODEX, "Codex"),
     (AGENT_ZED, "Zed Agent"),
+    (AGENT_OMP, "OMP"),
     (AGENT_COPILOT, "Copilot"),
 ];
 
@@ -184,6 +186,14 @@ pub fn run_stats() -> Result<()> {
             );
 
             all_raw.extend(raw_entries);
+        }
+    }
+
+    // OMP (Oh My Pi) — 从 SQLite 数据库读取已聚合的用量数据。
+    if let Some(home) = home_dir() {
+        let omp_db = home.join(".omp/stats.db");
+        if omp_db.exists() {
+            all_raw.extend(parser::omp::parse_omp_db(&omp_db));
         }
     }
 
