@@ -77,6 +77,9 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
 }
 
 /// 从 DB 加载所有聚合后的 UsageRecord。
+///
+/// 当前 `run_stats` 每次都重新聚合写入，此函数仅用于测试验证写入正确性。
+#[cfg(test)]
 pub(super) fn load_aggregated(conn: &Connection) -> Result<Vec<UsageRecord>> {
     let mut stmt = conn.prepare(
         "SELECT agent, model, date, in_tokens, out_tokens,
@@ -167,12 +170,6 @@ pub(super) fn replace_usage_records(conn: &Connection, records: &[UsageRecord]) 
             r.cache_creation_input_tokens,
         ])?;
     }
-    Ok(())
-}
-
-/// 删除指定路径的缓存条目。
-pub(super) fn remove_file_entry(conn: &Connection, path: &str) -> Result<()> {
-    conn.execute("DELETE FROM scanned_files WHERE path = ?1", params![path])?;
     Ok(())
 }
 
