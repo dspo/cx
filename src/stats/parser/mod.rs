@@ -60,35 +60,6 @@ pub(super) enum SourceKind {
 
 pub(super) fn parse_file(path: &Path, kind: SourceKind) -> Vec<RawEntry> {
     match kind {
-        SourceKind::Claude => {
-            let content = match std::fs::read_to_string(path) {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
-            claude::parse(&content)
-        }
-        SourceKind::CodexLike(agent) => {
-            let content = match std::fs::read_to_string(path) {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
-            let fallback_date = fallback_date_from_path(path);
-            codex::parse(&content, agent, fallback_date.as_deref(), path)
-        }
-        SourceKind::Copilot(agent) => {
-            let content = match std::fs::read_to_string(path) {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
-            copilot::parse(&content, agent, path)
-        }
-        SourceKind::OmpSession => {
-            let content = match std::fs::read_to_string(path) {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
-            omp_session::parse(&content)
-        }
         SourceKind::MimoSession => match mimo::parse(path) {
             Ok(entries) => entries,
             Err(e) => {
@@ -96,6 +67,22 @@ pub(super) fn parse_file(path: &Path, kind: SourceKind) -> Vec<RawEntry> {
                 Vec::new()
             }
         },
+        _ => {
+            let content = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            match kind {
+                SourceKind::Claude => claude::parse(&content),
+                SourceKind::CodexLike(agent) => {
+                    let fallback_date = fallback_date_from_path(path);
+                    codex::parse(&content, agent, fallback_date.as_deref(), path)
+                }
+                SourceKind::Copilot(agent) => copilot::parse(&content, agent, path),
+                SourceKind::OmpSession => omp_session::parse(&content),
+                SourceKind::MimoSession => unreachable!(),
+            }
+        }
     }
 }
 

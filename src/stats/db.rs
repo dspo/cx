@@ -65,7 +65,9 @@ pub(super) fn init_schema(conn: &Connection) -> Result<()> {
         .unwrap_or(0);
 
     if current_version < DB_VERSION {
-        // 首次建库或版本升级时重建 usage_records（由上层重新聚合填充）。
+        // v1 首次部署：全量清空后由上层重新聚合填充。
+        // 后续版本升级应改为增量迁移（ALTER TABLE / INSERT INTO SELECT），
+        // 避免丢失已缓存的用量数据。
         conn.execute("DELETE FROM usage_records", [])?;
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?1)",
@@ -158,26 +160,28 @@ pub(super) fn store_file_entries(
 ///
 /// 在事务中执行 DELETE + INSERT，避免中途崩溃导致表为空。
 pub(super) fn replace_usage_records(conn: &Connection, records: &[UsageRecord]) -> Result<()> {
-    conn.execute_batch("BEGIN")?;
-    conn.execute_batch("DELETE FROM usage_records")?;
-    let mut stmt = conn.prepare(
-        "INSERT INTO usage_records
-         (agent, model, date, in_tokens, out_tokens,
-          cache_read_input_tokens, cache_creation_input_tokens)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-    )?;
-    for r in records {
-        stmt.execute(params![
-            r.agent,
-            r.model,
-            r.date,
-            r.in_tokens,
-            r.out_tokens,
-            r.cache_read_input_tokens,
-            r.cache_creation_input_tokens,
-        ])?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("DELETE FROM usage_records")?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT INTO usage_records
+             (agent, model, date, in_tokens, out_tokens,
+              cache_read_input_tokens, cache_creation_input_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )?;
+        for r in records {
+            stmt.execute(params![
+                r.agent,
+                r.model,
+                r.date,
+                r.in_tokens,
+                r.out_tokens,
+                r.cache_read_input_tokens,
+                r.cache_creation_input_tokens,
+            ])?;
+        }
     }
-    conn.execute_batch("COMMIT")?;
+    tx.commit()?;
     Ok(())
 }
 

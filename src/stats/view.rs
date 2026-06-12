@@ -2297,6 +2297,8 @@ mod tests {
         assert_eq!(constraint_length(widths[1]), SHARE_WIDTH);
         assert_eq!(constraint_length(widths[2]), text_width("↑174.4m ↓547.9k"));
         assert_eq!(constraint_length(widths[5]), text_width("Codex"));
+        // Mimo column (index 6) should be at least min width (4)
+        assert!(constraint_length(widths[6]) >= 4);
     }
 
     #[test]
