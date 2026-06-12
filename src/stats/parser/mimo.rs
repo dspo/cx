@@ -36,17 +36,25 @@ pub(super) fn parse(db_path: &Path) -> Result<Vec<RawEntry>> {
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
 
     let mut out = Vec::new();
+    let mut row_errors = 0u32;
     for row in rows {
         let data_str = match row {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(_) => {
+                row_errors += 1;
+                continue;
+            }
         };
         let Ok(v) = serde_json::from_str::<Value>(&data_str) else {
+            row_errors += 1;
             continue;
         };
         if let Some(entry) = parse_one(&v) {
             out.push(entry);
         }
+    }
+    if row_errors > 0 {
+        eprintln!("cx: Mimo: {row_errors} rows skipped in {}", db_path.display());
     }
 
     Ok(out)
@@ -69,7 +77,7 @@ fn parse_one(v: &Value) -> Option<RawEntry> {
 
     let time_created = v.get("time")?.get("created")?.as_u64()?;
     let date = {
-        let iso = iso_from_unix_ms(time_created as i64);
+        let iso = iso_from_unix_ms(i64::try_from(time_created).ok()?);
         let d = date_from_iso(&iso);
         if d.is_empty() {
             return None;
@@ -170,5 +178,13 @@ mod tests {
         assert_eq!(entry.cache_creation_input_tokens, 100);
         assert_eq!(entry.input_tokens, 0);
         assert_eq!(entry.output_tokens, 0);
+    }
+
+    #[test]
+    fn parses_nonzero_reasoning_tokens() {
+        let data = r#"{"role":"assistant","time":{"created":1779772607934},"modelID":"deepseek-v3","tokens":{"input":500,"output":200,"reasoning":1234,"cache":{"read":0,"write":0}}}"#;
+        let entry = parse_json(data).unwrap();
+        assert_eq!(entry.reasoning_output_tokens, 1234);
+        assert_eq!(entry.output_tokens, 200);
     }
 }

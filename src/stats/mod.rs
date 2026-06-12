@@ -191,7 +191,17 @@ pub fn run_stats() -> Result<()> {
             let size = meta.len();
 
             let raw_entries = if db::file_unchanged(&conn, &path_key, mtime, size) {
-                db::get_cached_raw(&conn, &path_key)?
+                // 缓存命中（mtime+size 匹配），但 JSON 可能损坏/截断；
+                // 反序列化失败时走 cache-miss 重新解析源文件。
+                match db::get_cached_raw(&conn, &path_key) {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        eprintln!("cx: {e:#}");
+                        let entries = parse_file(&path, source.kind);
+                        db::store_file_entries(&conn, &path_key, mtime, size, &entries)?;
+                        entries
+                    }
+                }
             } else {
                 let entries = parse_file(&path, source.kind);
                 db::store_file_entries(&conn, &path_key, mtime, size, &entries)?;
@@ -205,7 +215,9 @@ pub fn run_stats() -> Result<()> {
     // 清理已卸载 agent 的 stale 缓存条目。
     let roots_refs: Vec<&Path> = active_source_roots.iter().map(|p| p.as_path()).collect();
     let extras_refs: Vec<&Path> = active_extra_files.iter().map(|p| p.as_path()).collect();
-    let _ = db::cleanup_stale_entries(&conn, &roots_refs, &extras_refs);
+    if let Err(e) = db::cleanup_stale_entries(&conn, &roots_refs, &extras_refs) {
+        eprintln!("cx: 清理过期缓存失败: {e:#}");
+    }
 
     let deduped = dedupe(all_raw);
     let records = bucket(deduped);

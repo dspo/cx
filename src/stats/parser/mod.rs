@@ -91,7 +91,10 @@ pub(super) fn parse_file(path: &Path, kind: SourceKind) -> Vec<RawEntry> {
         }
         SourceKind::MimoSession => match mimo::parse(path) {
             Ok(entries) => entries,
-            Err(_) => Vec::new(),
+            Err(e) => {
+                eprintln!("cx: Mimo 解析失败 ({}): {e:#}", path.display());
+                Vec::new()
+            }
         },
     }
 }
