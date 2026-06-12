@@ -37,6 +37,7 @@ pub(crate) const AGENT_CODEX: &str = "codex";
 pub(crate) const AGENT_ZED: &str = "zed";
 pub(crate) const AGENT_COPILOT: &str = "copilot";
 pub(crate) const AGENT_OMP: &str = "omp";
+pub(crate) const AGENT_MIMO: &str = "mimo";
 
 pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_CLAUDE, "Claude Code"),
@@ -44,6 +45,7 @@ pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_ZED, "Zed Agent"),
     (AGENT_OMP, "OMP"),
     (AGENT_COPILOT, "Copilot"),
+    (AGENT_MIMO, "Mimo"),
 ];
 
 /// 折线图调色板（与 Claude `/usage` 风格相近）。
@@ -101,6 +103,11 @@ fn log_sources() -> Vec<LogSource> {
             extra_file: None,
             kind: SourceKind::OmpSession,
         },
+        LogSource {
+            root: home.join(".local/share/mimocode"),
+            extra_file: None,
+            kind: SourceKind::MimoSession,
+        },
     ]
 }
 
@@ -150,7 +157,14 @@ pub fn run_stats() -> Result<()> {
             active_extra_files.push(extra.clone());
         }
 
-        let mut files = if source.root.exists() {
+let mut files = if matches!(source.kind, SourceKind::MimoSession) {
+            let db_path = source.root.join("mimocode.db");
+            if db_path.is_file() {
+                vec![db_path]
+            } else {
+                Vec::new()
+            }
+        } else if source.root.exists() {
             collect_jsonl_files(&source.root)
         } else {
             Vec::new()
@@ -177,7 +191,17 @@ pub fn run_stats() -> Result<()> {
             let size = meta.len();
 
             let raw_entries = if db::file_unchanged(&conn, &path_key, mtime, size) {
-                db::get_cached_raw(&conn, &path_key)?
+                // 缓存命中（mtime+size 匹配），但 JSON 可能损坏/截断；
+                // 反序列化失败时走 cache-miss 重新解析源文件。
+                match db::get_cached_raw(&conn, &path_key) {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        eprintln!("cx: {e:#}");
+                        let entries = parse_file(&path, source.kind);
+                        db::store_file_entries(&conn, &path_key, mtime, size, &entries)?;
+                        entries
+                    }
+                }
             } else {
                 let entries = parse_file(&path, source.kind);
                 db::store_file_entries(&conn, &path_key, mtime, size, &entries)?;
@@ -191,7 +215,9 @@ pub fn run_stats() -> Result<()> {
     // 清理已卸载 agent 的 stale 缓存条目。
     let roots_refs: Vec<&Path> = active_source_roots.iter().map(|p| p.as_path()).collect();
     let extras_refs: Vec<&Path> = active_extra_files.iter().map(|p| p.as_path()).collect();
-    let _ = db::cleanup_stale_entries(&conn, &roots_refs, &extras_refs);
+if let Err(e) = db::cleanup_stale_entries(&conn, &roots_refs, &extras_refs) {
+        eprintln!("cx: 清理过期缓存失败: {e:#}");
+    }
 
     let deduped = dedupe(all_raw);
     let records = bucket(deduped);
