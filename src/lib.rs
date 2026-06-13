@@ -90,15 +90,22 @@ struct EndpointConfig {
     models: Vec<ModelConfig>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ModelConfig {
     id: String,
+    #[serde(default)]
     swe_pro: Option<String>,
+    #[serde(default)]
     lcb_pro: Option<String>,
+    #[serde(default)]
     hle: Option<String>,
+    #[serde(default)]
     desc: Option<String>,
+    #[serde(default)]
     context: Option<String>,
+    #[serde(default)]
     agents: Vec<String>,
+    #[serde(default)]
     env: BTreeMap<String, String>,
 }
 
@@ -1923,11 +1930,11 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
     }
 
     // Agent 级别环境变量
-    env.extend(selection.agent_env.clone());
+    env.extend(selection.agent_env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
     // Model 级别环境变量（覆盖 agent 同名变量）
     if let Some(ref model) = selection.model {
-        env.extend(model.env.clone());
+        env.extend(model.env.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
 
     let summary = match &selection.model {
