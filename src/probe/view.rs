@@ -1,3 +1,5 @@
+use std::hash::{Hash, Hasher};
+
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Row, Table};
@@ -92,11 +94,13 @@ fn draw_table(f: &mut ratatui::Frame, area: Rect, app: &ProbeApp) {
                 Cell::from(completions_text).style(completions_style),
             ]);
 
-            // 只在选中行时应用选中样式，避免覆盖 Cell 级别样式
+            // 选中行用反色高亮；非选中行按 provider 应用浅色底纹分组。
+            // tint 作为行级底色，provider/model 列继承它；
+            // 状态列若自带背景色（如可用的绿底）会覆盖 tint，符合预期。
             if actual_idx == app.selected_row {
                 row_widget.style(selected_style)
             } else {
-                row_widget
+                row_widget.style(normal_style.bg(provider_tint(&row.provider_name)))
             }
         })
         .collect();
@@ -117,6 +121,24 @@ fn draw_table(f: &mut ratatui::Frame, area: Rect, app: &ProbeApp) {
 }
 
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// 不同 provider 的浅色底纹调色板（RGB 浅色，确保深色前景文字可读）。
+const PROVIDER_TINTS: &[Color] = &[
+    Color::Rgb(40, 44, 52),  // 冷灰蓝
+    Color::Rgb(48, 42, 52),  // 浅紫灰
+    Color::Rgb(40, 50, 46),  // 浅青灰
+    Color::Rgb(52, 48, 40),  // 浅棕灰
+    Color::Rgb(44, 46, 54),  // 浅靛灰
+    Color::Rgb(50, 44, 46),  // 浅玫灰
+];
+
+/// 按 provider 名称稳定映射到一个浅色底纹，使同一 provider 的所有行底色一致。
+fn provider_tint(provider_name: &str) -> Color {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    provider_name.hash(&mut hasher);
+    let idx = (hasher.finish() % PROVIDER_TINTS.len() as u64) as usize;
+    PROVIDER_TINTS[idx]
+}
 
 fn check_all_failed(row: &ProbeRow) -> bool {
     row.results.values().all(|result| {
@@ -363,5 +385,20 @@ mod tests {
     fn test_format_cell_none() {
         let (text, _) = format_cell(None, 0);
         assert_eq!(text, "-");
+    }
+
+    #[test]
+    fn test_provider_tint_is_stable() {
+        // 同一 provider 多次映射结果一致
+        assert_eq!(provider_tint("百炼"), provider_tint("百炼"));
+        assert_eq!(provider_tint("Packy API"), provider_tint("Packy API"));
+    }
+
+    #[test]
+    fn test_provider_tint_within_palette() {
+        // 任意 provider 名都落在调色板内，不会越界 panic
+        for name in ["百炼", "Packy API", "Xiaomi MIMO", "APIHub", ""] {
+            assert!(PROVIDER_TINTS.contains(&provider_tint(name)));
+        }
     }
 }
