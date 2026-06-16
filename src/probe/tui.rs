@@ -1,5 +1,5 @@
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -203,23 +203,23 @@ fn start_probing(
         }
     }
 
-    // 限制并发探测数量
-    const MAX_CONCURRENT: usize = 10;
-    let active_count = Arc::new((Mutex::new(0usize), Condvar::new()));
+    // 并发策略：同一 endpoint（同一上游 URL）的请求串行，不同 endpoint 尽量并发。
+    // 为每个唯一 URL 分配一把锁，线程先取到对应锁再发起探测。
+    let mut endpoint_locks: std::collections::HashMap<String, Arc<Mutex<()>>> =
+        std::collections::HashMap::new();
+    for (_, _, _, url, _, _) in &probe_items {
+        endpoint_locks
+            .entry(url.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())));
+    }
 
     for (row_idx, wire_api, provider, url, model_id, auth) in probe_items {
         let tx = tx.clone();
-        let active_count = active_count.clone();
+        let lock = endpoint_locks[&url].clone();
 
         std::thread::spawn(move || {
-            // 等待有空位（限制并发）
-            let (count, cv) = &*active_count;
-            let mut count = count.lock().unwrap();
-            while *count >= MAX_CONCURRENT {
-                count = cv.wait(count).unwrap();
-            }
-            *count += 1;
-            drop(count);
+            // 同一 endpoint 同时只允许一个请求在飞。
+            let _guard = lock.lock().unwrap();
 
             let result = super::do_probe(&provider, &url, wire_api, &model_id, auth);
             let _ = tx.send(ProbeResultItem {
@@ -227,12 +227,6 @@ fn start_probing(
                 wire_api,
                 result,
             });
-
-            // 释放并发槽位
-            let (count, cv) = &*active_count;
-            let mut count = count.lock().unwrap();
-            *count -= 1;
-            cv.notify_one();
         });
     }
 
