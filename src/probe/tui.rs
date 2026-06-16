@@ -1,5 +1,5 @@
 use std::sync::mpsc::{channel, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -203,23 +203,30 @@ fn start_probing(
         }
     }
 
-    // 并发策略：同一 endpoint（同一上游 URL）的请求串行，不同 endpoint 尽量并发。
-    // 为每个唯一 URL 分配一把锁，线程先取到对应锁再发起探测。
-    let mut endpoint_locks: std::collections::HashMap<String, Arc<Mutex<()>>> =
+    // 并发策略：同一 endpoint（同一上游 URL）最多 6 个请求并发，不同 endpoint 尽量并发。
+    // 为每个唯一 URL 分配一个信号量（计数 + 条件变量），线程进入前抢占槽位。
+    const MAX_PER_ENDPOINT: usize = 6;
+    let mut endpoint_sems: std::collections::HashMap<String, Arc<(Mutex<usize>, Condvar)>> =
         std::collections::HashMap::new();
     for (_, _, _, url, _, _) in &probe_items {
-        endpoint_locks
+        endpoint_sems
             .entry(url.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())));
+            .or_insert_with(|| Arc::new((Mutex::new(0usize), Condvar::new())));
     }
 
     for (row_idx, wire_api, provider, url, model_id, auth) in probe_items {
         let tx = tx.clone();
-        let lock = endpoint_locks[&url].clone();
+        let sem = endpoint_sems[&url].clone();
 
         std::thread::spawn(move || {
-            // 同一 endpoint 同时只允许一个请求在飞。
-            let _guard = lock.lock().unwrap();
+            // 抢占该 endpoint 的并发槽位（最多 MAX_PER_ENDPOINT 个）。
+            let (count, cv) = &*sem;
+            let mut count = count.lock().unwrap();
+            while *count >= MAX_PER_ENDPOINT {
+                count = cv.wait(count).unwrap();
+            }
+            *count += 1;
+            drop(count);
 
             let result = super::do_probe(&provider, &url, wire_api, &model_id, auth);
             let _ = tx.send(ProbeResultItem {
@@ -227,6 +234,12 @@ fn start_probing(
                 wire_api,
                 result,
             });
+
+            // 释放槽位并唤醒等待者。
+            let (count, cv) = &*sem;
+            let mut count = count.lock().unwrap();
+            *count -= 1;
+            cv.notify_one();
         });
     }
 
