@@ -88,17 +88,16 @@ fn draw_table(f: &mut ratatui::Frame, area: Rect, app: &ProbeApp) {
             let (completions_text, completions_style) =
                 format_cell(row.results.get(&WireApi::Completions), app.spinner_tick);
 
-            // 该 provider 的斑马纹底色（白/浅灰交替），仅作用于左侧 Provider/Model 两列，
-            // 状态列保持终端默认底色，避免浅底压暗状态文字。
+            // 该 provider 的斑马纹底色（白/浅灰交替），贯穿整行。
             let group_idx = provider_group.get(row.provider_name.as_str()).copied().unwrap_or(0);
             let tint = zebra_tint(group_idx);
 
             // 浅底上文字统一用黑色前景；全部失败时 model 仍用红色突出。
-            let provider_cell_style = Style::default().bg(tint).fg(Color::Black);
+            let provider_cell_style = Style::default().fg(Color::Black);
             let model_style = if all_failed {
-                Style::default().bg(tint).fg(Color::Red)
+                Style::default().fg(Color::Red)
             } else {
-                Style::default().bg(tint).fg(Color::Black)
+                Style::default().fg(Color::Black)
             };
 
             let row_widget = Row::new(vec![
@@ -109,11 +108,12 @@ fn draw_table(f: &mut ratatui::Frame, area: Rect, app: &ProbeApp) {
                 Cell::from(completions_text).style(completions_style),
             ]);
 
-            // 选中行整行反色高亮；非选中行保持各 Cell 自带样式（含斑马纹底色）。
+            // 选中行整行反色高亮；非选中行整行套斑马纹底色，各 Cell 仅设前景色，
+            // 底色由行级 tint 贯穿透出。
             if actual_idx == app.selected_row {
                 row_widget.style(selected_style)
             } else {
-                row_widget.style(normal_style)
+                row_widget.style(normal_style.bg(tint))
             }
         })
         .collect();
@@ -163,15 +163,16 @@ fn format_cell(result: Option<&super::types::ProbeCellResult>, spinner_tick: usi
                     } else {
                         "可用".to_string()
                     };
-                    // 已配置：绿底白字；未配置：绿色文字
+                    // 浅底斑马纹上用深绿字表示可用（不再用绿底，避免盖掉行底色）；
+                    // 未配置用稍浅的绿字区分。
                     if result.configured {
-                        (text, Style::default().bg(Color::Green).fg(Color::White))
+                        (text, Style::default().fg(Color::Rgb(0, 128, 0)).add_modifier(Modifier::BOLD))
                     } else {
-                        (text, Style::default().fg(Color::Green))
+                        (text, Style::default().fg(Color::Rgb(60, 140, 60)))
                     }
                 }
                 ProbeStatus::NotApplicable => {
-                    ("-".to_string(), Style::default().fg(Color::DarkGray))
+                    ("-".to_string(), Style::default().fg(Color::Rgb(120, 120, 120)))
                 }
                 ProbeStatus::ServerError => {
                     let text = if let Some(status) = result.http_status {
@@ -185,9 +186,9 @@ fn format_cell(result: Option<&super::types::ProbeCellResult>, spinner_tick: usi
                         "🔴 错误".to_string()
                     };
                     if result.configured {
-                        (text, Style::default().fg(Color::Red))
+                        (text, Style::default().fg(Color::Rgb(176, 0, 0)))
                     } else {
-                        ("-".to_string(), Style::default().fg(Color::DarkGray))
+                        ("-".to_string(), Style::default().fg(Color::Rgb(120, 120, 120)))
                     }
                 }
                 ProbeStatus::ClientError => {
@@ -202,25 +203,25 @@ fn format_cell(result: Option<&super::types::ProbeCellResult>, spinner_tick: usi
                         "🟡 错误".to_string()
                     };
                     if result.configured {
-                        (text, Style::default().fg(Color::Yellow))
+                        (text, Style::default().fg(Color::Rgb(150, 110, 0)))
                     } else {
-                        ("-".to_string(), Style::default().fg(Color::DarkGray))
+                        ("-".to_string(), Style::default().fg(Color::Rgb(120, 120, 120)))
                     }
                 }
                 ProbeStatus::Probing => {
                     let frame = SPINNER_FRAMES[spinner_tick % SPINNER_FRAMES.len()];
-                    (format!("{}", frame), Style::default().fg(Color::Cyan))
+                    (format!("{}", frame), Style::default().fg(Color::Rgb(0, 120, 120)))
                 }
                 ProbeStatus::Unknown => {
                     if result.configured {
-                        ("?".to_string(), Style::default().fg(Color::DarkGray))
+                        ("?".to_string(), Style::default().fg(Color::Rgb(120, 120, 120)))
                     } else {
-                        ("-".to_string(), Style::default().fg(Color::DarkGray))
+                        ("-".to_string(), Style::default().fg(Color::Rgb(120, 120, 120)))
                     }
                 }
             }
         }
-        None => ("-".to_string(), Style::default().fg(Color::DarkGray)),
+        None => ("-".to_string(), Style::default().fg(Color::Rgb(120, 120, 120))),
     }
 }
 
