@@ -276,6 +276,7 @@ impl ProviderConfig {
                         hle: model.hle.clone(),
                         desc: model.desc.clone(),
                         context: model.context.clone(),
+                        wire_apis: model.wire_apis.clone(),
                         agents: model.agents.clone(),
                         env: model.env.clone(),
                     })
@@ -312,6 +313,7 @@ struct ResolvedModel {
     desc: String,
     context: String,
     wire_api: WireApi,
+    model_wire_apis: Vec<WireApi>,
     provider_name: String,
     endpoint_url: String,
     visible_agents: Vec<String>,
@@ -326,6 +328,14 @@ impl ResolvedModel {
         endpoint: &EndpointConfig,
         model: &ModelConfig,
     ) -> Self {
+        let model_wire_apis: Vec<WireApi> = if model.wire_apis.is_empty() {
+            vec![WireApi::from_str(&endpoint.wire_api)]
+        } else {
+            model.wire_apis.iter()
+                .map(|s| WireApi::from_str(s))
+                .filter(|w| *w != WireApi::Unavailable)
+                .collect()
+        };
         Self {
             id: model.id.clone(),
             swe_pro: model.swe_pro.clone().unwrap_or_else(|| "—".to_string()),
@@ -334,6 +344,7 @@ impl ResolvedModel {
             desc: model.desc.clone().unwrap_or_default(),
             context: model.context.clone().unwrap_or_else(|| "—".to_string()),
             wire_api: WireApi::from_str(&endpoint.wire_api),
+            model_wire_apis,
             provider_name: provider.name.clone(),
             endpoint_url: endpoint.url.clone(),
             visible_agents: effective_agents_for_model(config, provider, endpoint, model),
@@ -379,32 +390,44 @@ impl ModelOption {
         }
     }
 
-    fn default_variant_index(&self) -> usize {
-        self.variants
+    fn default_variant_index(&self, agent_wire_apis: Option<&[WireApi]>) -> usize {
+        let filtered: Vec<(usize, &ResolvedModel)> = self
+            .variants
             .iter()
             .enumerate()
+            .filter(|(_, v)| {
+                agent_wire_apis.map_or(true, |apis| apis.contains(&v.wire_api))
+            })
+            .collect();
+        filtered
+            .into_iter()
             .min_by_key(|(_, variant)| variant.wire_api.priority())
             .map(|(index, _)| index)
             .unwrap_or(0)
     }
 
-    fn selected_variant_index(&self, selected_wire_apis: &BTreeMap<String, usize>) -> usize {
+    fn selected_variant_index(
+        &self,
+        selected_wire_apis: &BTreeMap<String, usize>,
+        agent_wire_apis: Option<&[WireApi]>,
+    ) -> usize {
         selected_wire_apis
             .get(&self.selection_key)
             .copied()
             .filter(|index| *index < self.variants.len())
-            .unwrap_or_else(|| self.default_variant_index())
+            .unwrap_or_else(|| self.default_variant_index(agent_wire_apis))
     }
 
     fn selected_variant<'a>(
         &'a self,
         selected_wire_apis: &BTreeMap<String, usize>,
+        agent_wire_apis: Option<&[WireApi]>,
     ) -> &'a ResolvedModel {
-        &self.variants[self.selected_variant_index(selected_wire_apis)]
+        &self.variants[self.selected_variant_index(selected_wire_apis, agent_wire_apis)]
     }
 
     fn formatted_row(&self, selected_wire_apis: &BTreeMap<String, usize>) -> String {
-        let selected = self.selected_variant(selected_wire_apis);
+        let selected = self.selected_variant(selected_wire_apis, None);
         format!(
             "{:<24} {:>7} {:>7} {:>6}  {:<11} {:>8}  {}",
             self.id,
@@ -441,30 +464,14 @@ fn default_wire_apis_for_agent(agent_id: &str) -> Vec<WireApi> {
     match canonical_agent_id(agent_id) {
         "copilot" => vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
         "claude" => vec![WireApi::Anthropic],
-        "codex" => vec![WireApi::Responses],
+        "codex" | "Codex.app" => vec![WireApi::Responses],
         _ => Vec::new(),
     }
 }
 
-fn resolve_agent_wire_apis(agent_id: &str, configured: &[String]) -> Vec<WireApi> {
-    let source = if configured.is_empty() {
-        default_wire_apis_for_agent(agent_id)
-            .into_iter()
-            .map(|wire_api| wire_api.display().to_string())
-            .collect::<Vec<_>>()
-    } else {
-        configured.to_vec()
-    };
-
-    let mut resolved = Vec::new();
-    for item in source {
-        let wire_api = WireApi::from_str(&item);
-        if wire_api == WireApi::Unavailable || resolved.contains(&wire_api) {
-            continue;
-        }
-        resolved.push(wire_api);
-    }
-    resolved
+fn resolve_agent_wire_apis(agent_id: &str, _configured: &[String]) -> Vec<WireApi> {
+    // Agent wire_apis are hardcoded; config file's wire_apis field is ignored.
+    default_wire_apis_for_agent(agent_id)
 }
 
 fn all_compatible_agents(config: &CxConfig, endpoint: &EndpointConfig) -> Vec<String> {
@@ -586,6 +593,7 @@ struct Selection {
     agent_binary: String,
     agent_args: Vec<String>,
     agent_env: BTreeMap<String, String>,
+    selected_wire_api: WireApi,
     provider: ResolvedProvider,
     model: Option<ResolvedModel>,
 }
@@ -615,19 +623,33 @@ fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
         {
             continue;
         }
-        let binary = if id == "codex" {
-            "codex".to_string()
-        } else {
-            agent.binary.clone()
-        };
         let supported_wire_apis = resolve_agent_wire_apis(&id, &agent.wire_apis);
-        agents.push(ResolvedAgent {
-            id,
-            binary,
-            args: agent.args.clone(),
-            supported_wire_apis,
-            env: agent.env.clone(),
-        });
+
+        if id == "codex" {
+            // codex 配置展开为 CLI 和 Desktop App 两条入口
+            agents.push(ResolvedAgent {
+                id: "codex".into(),
+                binary: "codex".into(),
+                args: vec![],
+                supported_wire_apis: supported_wire_apis.clone(),
+                env: agent.env.clone(),
+            });
+            agents.push(ResolvedAgent {
+                id: "Codex.app".into(),
+                binary: "codex".into(),
+                args: vec!["app".into()],
+                supported_wire_apis,
+                env: agent.env.clone(),
+            });
+        } else {
+            agents.push(ResolvedAgent {
+                id,
+                binary: agent.binary.clone(),
+                args: agent.args.clone(),
+                supported_wire_apis,
+                env: agent.env.clone(),
+            });
+        }
     }
     agents
 }
@@ -907,6 +929,7 @@ fn merge_codex_config(
     existing: Option<&str>,
     model: &ResolvedModel,
     workspace_root: &Path,
+    wire_api: WireApi,
 ) -> Result<String> {
     let project_section = format!(
         "[projects.{}]",
@@ -941,12 +964,12 @@ fn merge_codex_config(
         }
     }
 
-    let wire_api = model.wire_api.launch_value()?;
+    let wire_api_str = wire_api.launch_value()?;
     let mut rendered = format!(
         "model = {}\nmodel_provider = \"dashscope\"\n\n[model_providers.dashscope]\nname = \"DashScope\"\nbase_url = {}\nenv_key = \"DASHSCOPE_API_KEY\"\nwire_api = {}\n\n{}{}\ntrust_level = \"trusted\"\n",
         toml_basic_string(&model.id),
         toml_basic_string(&model.endpoint_url),
-        toml_basic_string(wire_api),
+        toml_basic_string(wire_api_str),
         project_section,
         "\n"
     );
@@ -964,6 +987,7 @@ fn merge_codex_config(
 fn prepare_codex_launch_home(
     model: &ResolvedModel,
     env: &mut BTreeMap<String, String>,
+    wire_api: WireApi,
 ) -> Result<()> {
     let real_home = home_dir().context("无法解析用户主目录")?;
     let fake_home = create_launch_home("codex")?;
@@ -975,7 +999,7 @@ fn prepare_codex_launch_home(
 
     let existing_config = fs::read_to_string(real_codex_dir.join("config.toml")).ok();
     let merged_config =
-        merge_codex_config(existing_config.as_deref(), model, &env::current_dir()?)?;
+        merge_codex_config(existing_config.as_deref(), model, &env::current_dir()?, wire_api)?;
     write_private_file(&fake_codex_dir.join("config.toml"), &merged_config)?;
 
     env.insert("HOME".into(), fake_home.display().to_string());
@@ -984,6 +1008,34 @@ fn prepare_codex_launch_home(
         fake_home.join(".config").display().to_string(),
     );
     env.insert("CODEX_HOME".into(), fake_codex_dir.display().to_string());
+    Ok(())
+}
+
+/// 为 Codex Desktop App 准备 fake home。
+/// 与 CLI 路径不同：Desktop App 是 GUI 进程不能通过 exec() 继承伪造的 HOME，
+/// 因此只设置 CODEX_HOME 指向 fake home，不修改 HOME 环境变量。
+fn prepare_codex_launch_home_for_app(
+    model: &ResolvedModel,
+    apikey: String,
+    env: &mut BTreeMap<String, String>,
+    wire_api: WireApi,
+) -> Result<()> {
+    let real_home = home_dir().context("无法解析用户主目录")?;
+    let fake_home = create_launch_home("codex-app")?;
+    mirror_home_entries(&real_home, &fake_home, &[".codex"])?;
+
+    let real_codex_dir = real_home.join(".codex");
+    let fake_codex_dir = fake_home.join(".codex");
+    materialize_passthrough_dir(&real_codex_dir, &fake_codex_dir, &["config.toml"])?;
+
+    let existing_config = fs::read_to_string(real_codex_dir.join("config.toml")).ok();
+    let merged_config =
+        merge_codex_config(existing_config.as_deref(), model, &env::current_dir()?, wire_api)?;
+    write_private_file(&fake_codex_dir.join("config.toml"), &merged_config)?;
+    println!("[cx] 注入配置: {}", fake_codex_dir.join("config.toml").display());
+
+    env.insert("CODEX_HOME".into(), fake_codex_dir.display().to_string());
+    env.insert("DASHSCOPE_API_KEY".into(), apikey);
     Ok(())
 }
 
@@ -1900,16 +1952,14 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
                 args.push(model.id.clone());
                 args.extend(passthrough_args.iter().cloned());
             }
-            "codex" => {
-                if model.wire_api != WireApi::Responses {
-                    bail!(
-                        "`codex` 当前仅支持 responses endpoint 模型；`{}` 在内嵌配置中标记为 {}。",
-                        model.id,
-                        model.wire_api.display()
-                    );
+            "codex" | "Codex.app" => {
+                let is_desktop_app = agent_id == "Codex.app";
+                if is_desktop_app {
+                    prepare_codex_launch_home_for_app(model, apikey, &mut env, selection.selected_wire_api)?;
+                } else {
+                    env.insert("DASHSCOPE_API_KEY".into(), apikey);
+                    prepare_codex_launch_home(model, &mut env, selection.selected_wire_api)?;
                 }
-                env.insert("DASHSCOPE_API_KEY".into(), apikey);
-                prepare_codex_launch_home(model, &mut env)?;
                 args.extend(passthrough_args.iter().cloned());
             }
             _ => {
@@ -3182,6 +3232,14 @@ impl AppState {
         resolved_agents(&self.config)
     }
 
+    fn agent_wire_apis(&self) -> Vec<WireApi> {
+        self.resolved_agents()
+            .into_iter()
+            .find(|a| a.id == self.selected_agent_id)
+            .map(|a| a.supported_wire_apis)
+            .unwrap_or_default()
+    }
+
     fn current_index(&self) -> usize {
         match self.step {
             Step::Agent => self.agent_index,
@@ -3276,7 +3334,7 @@ impl AppState {
             return;
         }
 
-        let current = option.selected_variant_index(&self.model_wire_api_indexes);
+        let current = option.selected_variant_index(&self.model_wire_api_indexes, Some(&self.agent_wire_apis()));
         let next = if move_right {
             (current + 1) % option.variants.len()
         } else if current == 0 {
@@ -3311,11 +3369,14 @@ impl AppState {
                     None
                 } else {
                     let agent = find_agent(&self.config, &self.selected_agent_id).unwrap();
+                    let agent_wire_apis = self.agent_wire_apis();
+                    let selected_wire_api = agent_wire_apis.first().copied().unwrap_or(WireApi::Unavailable);
                     Some(Selection {
                         agent_id: agent.id.clone(),
                         agent_binary: agent.binary.clone(),
                         agent_args: agent.args.clone(),
                         agent_env: agent.env.clone(),
+                        selected_wire_api,
                         provider,
                         model: None,
                     })
@@ -3327,14 +3388,23 @@ impl AppState {
                 let available = self.current_model_options(models);
                 let option = available.get(self.model_index)?;
                 let selected_variant = option
-                    .selected_variant(&self.model_wire_api_indexes)
+                    .selected_variant(&self.model_wire_api_indexes, Some(&self.agent_wire_apis()))
                     .clone();
                 let agent = find_agent(&self.config, &self.selected_agent_id).unwrap();
+                let agent_wire_apis = self.agent_wire_apis();
+                let mut selected_wire_api = WireApi::Unavailable;
+                for aw in &agent_wire_apis {
+                    if selected_variant.model_wire_apis.contains(aw) {
+                        selected_wire_api = *aw;
+                        break;
+                    }
+                }
                 Some(Selection {
                     agent_id: agent.id.clone(),
                     agent_binary: agent.binary.clone(),
                     agent_args: agent.args.clone(),
                     agent_env: agent.env.clone(),
+                    selected_wire_api,
                     provider,
                     model: Some(selected_variant),
                 })
@@ -3575,6 +3645,7 @@ mod tests {
             desc: String::new(),
             context: "—".into(),
             wire_api,
+            model_wire_apis: vec![wire_api],
             provider_name: "DashScope".into(),
             endpoint_url: endpoint_url.into(),
             visible_agents: vec!["codex".into(), "claude".into()],
@@ -3735,6 +3806,7 @@ mod tests {
             agent_binary: fake_binary.display().to_string(),
             agent_args: Vec::new(),
             agent_env: BTreeMap::new(),
+            selected_wire_api: WireApi::Responses,
             provider: ResolvedProvider {
                 name: "Codex Default".into(),
                 has_endpoints: false,
@@ -3756,6 +3828,7 @@ mod tests {
             agent_binary: fake_binary.display().to_string(),
             agent_args: Vec::new(),
             agent_env: BTreeMap::new(),
+            selected_wire_api: WireApi::Responses,
             provider: ResolvedProvider {
                 name: "Test".into(),
                 has_endpoints: false,
@@ -3788,6 +3861,7 @@ mod tests {
             agent_binary: fake_binary.display().to_string(),
             agent_args: Vec::new(),
             agent_env: BTreeMap::new(),
+            selected_wire_api: WireApi::Responses,
             provider: ResolvedProvider {
                 name: "DashScope".into(),
                 has_endpoints: true,
@@ -3801,6 +3875,7 @@ mod tests {
                 desc: String::new(),
                 context: "—".into(),
                 wire_api: WireApi::Anthropic,
+                model_wire_apis: vec![WireApi::Anthropic],
                 provider_name: "DashScope".into(),
                 endpoint_url: "https://dashscope.aliyuncs.com/apps/anthropic".into(),
                 visible_agents: vec!["claude".into()],
@@ -3845,6 +3920,7 @@ mod tests {
             agent_binary: fake_binary.display().to_string(),
             agent_args: Vec::new(),
             agent_env: BTreeMap::new(),
+            selected_wire_api: WireApi::Responses,
             provider: ResolvedProvider {
                 name: "Packy API".into(),
                 has_endpoints: true,
@@ -3858,6 +3934,7 @@ mod tests {
                 desc: String::new(),
                 context: "—".into(),
                 wire_api: WireApi::Anthropic,
+                model_wire_apis: vec![WireApi::Anthropic],
                 provider_name: "Packy API".into(),
                 endpoint_url: "https://www.packyapi.com/".into(),
                 visible_agents: vec!["copilot".into()],
@@ -3898,6 +3975,7 @@ mod tests {
             agent_binary: "codex".into(),
             agent_args: Vec::new(),
             agent_env: BTreeMap::new(),
+            selected_wire_api: WireApi::Responses,
             provider: ResolvedProvider {
                 name: "Default".into(),
                 has_endpoints: false,
@@ -3922,6 +4000,7 @@ mod tests {
             agent_binary: fake_binary.display().to_string(),
             agent_args: Vec::new(),
             agent_env,
+            selected_wire_api: WireApi::Anthropic,
             provider: ResolvedProvider {
                 name: "Test".into(),
                 has_endpoints: false,
@@ -3945,6 +4024,7 @@ mod tests {
             agent_binary: fake_binary.display().to_string(),
             agent_args: Vec::new(),
             agent_env: BTreeMap::new(),
+            selected_wire_api: WireApi::Responses,
             provider: ResolvedProvider {
                 name: "DashScope".into(),
                 has_endpoints: true,
@@ -3958,6 +4038,7 @@ mod tests {
                 desc: String::new(),
                 context: "—".into(),
                 wire_api: WireApi::Anthropic,
+                model_wire_apis: vec![WireApi::Anthropic],
                 provider_name: "DashScope".into(),
                 endpoint_url: "https://dashscope.aliyuncs.com/apps/anthropic".into(),
                 visible_agents: vec!["claude".into()],
@@ -3989,6 +4070,7 @@ mod tests {
             agent_binary: fake_binary.display().to_string(),
             agent_args: Vec::new(),
             agent_env,
+            selected_wire_api: WireApi::Anthropic,
             provider: ResolvedProvider {
                 name: "DashScope".into(),
                 has_endpoints: true,
@@ -4002,6 +4084,7 @@ mod tests {
                 desc: String::new(),
                 context: "—".into(),
                 wire_api: WireApi::Anthropic,
+                model_wire_apis: vec![WireApi::Anthropic],
                 provider_name: "DashScope".into(),
                 endpoint_url: "https://dashscope.aliyuncs.com/apps/anthropic".into(),
                 visible_agents: vec!["claude".into()],
@@ -4475,6 +4558,7 @@ trust_level = "trusted"
                 WireApi::Responses,
             ),
             Path::new("/tmp/workspace"),
+            WireApi::Responses,
         )
         .unwrap();
 
