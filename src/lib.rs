@@ -104,6 +104,8 @@ struct ModelConfig {
     #[serde(default)]
     context: Option<String>,
     #[serde(default)]
+    wire_apis: Vec<String>,
+    #[serde(default)]
     agents: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
