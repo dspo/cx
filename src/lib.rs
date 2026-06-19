@@ -1011,9 +1011,9 @@ fn prepare_codex_launch_home(
     Ok(())
 }
 
-/// 为 Codex Desktop App 准备 fake home。
-/// 与 CLI 路径不同：Desktop App 是 GUI 进程不能通过 exec() 继承伪造的 HOME，
-/// 因此只设置 CODEX_HOME 指向 fake home，不修改 HOME 环境变量。
+/// 为 Codex Desktop App 准备注入配置。
+/// 使用固定目录 ~/.config/cx/.codex/，Symlink 真实 ~/.codex/ 内容（config.toml 除外），
+/// 写入我们注入的 config.toml + DASHSCOPE_API_KEY，Codex Desktop 读 CODEX_HOME 指向此目录。
 fn prepare_codex_launch_home_for_app(
     model: &ResolvedModel,
     apikey: String,
@@ -1021,20 +1021,25 @@ fn prepare_codex_launch_home_for_app(
     wire_api: WireApi,
 ) -> Result<()> {
     let real_home = home_dir().context("无法解析用户主目录")?;
-    let fake_home = create_launch_home("codex-app")?;
-    mirror_home_entries(&real_home, &fake_home, &[".codex"])?;
-
+    let codex_dir = cx_state_dir()?.join(".codex");
     let real_codex_dir = real_home.join(".codex");
-    let fake_codex_dir = fake_home.join(".codex");
-    materialize_passthrough_dir(&real_codex_dir, &fake_codex_dir, &["config.toml"])?;
 
+    // 创建固定目录
+    if !codex_dir.exists() {
+        std::fs::create_dir_all(&codex_dir)?;
+    }
+
+    // Symlink 真实 .codex 内容（auth.json 等），config.toml 除外
+    materialize_passthrough_dir(&real_codex_dir, &codex_dir, &["config.toml"])?;
+
+    // 读取真实 config.toml（如有）做保留
     let existing_config = fs::read_to_string(real_codex_dir.join("config.toml")).ok();
     let merged_config =
         merge_codex_config(existing_config.as_deref(), model, &env::current_dir()?, wire_api)?;
-    write_private_file(&fake_codex_dir.join("config.toml"), &merged_config)?;
-    println!("[cx] 注入配置: {}", fake_codex_dir.join("config.toml").display());
+    write_private_file(&codex_dir.join("config.toml"), &merged_config)?;
+    println!("[cx] 注入配置: {}", codex_dir.join("config.toml").display());
 
-    env.insert("CODEX_HOME".into(), fake_codex_dir.display().to_string());
+    env.insert("CODEX_HOME".into(), codex_dir.display().to_string());
     env.insert("DASHSCOPE_API_KEY".into(), apikey);
     Ok(())
 }
