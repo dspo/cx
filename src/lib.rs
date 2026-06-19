@@ -426,8 +426,12 @@ impl ModelOption {
         &self.variants[self.selected_variant_index(selected_wire_apis, agent_wire_apis)]
     }
 
-    fn formatted_row(&self, selected_wire_apis: &BTreeMap<String, usize>) -> String {
-        let selected = self.selected_variant(selected_wire_apis, None);
+    fn formatted_row(
+        &self,
+        selected_wire_apis: &BTreeMap<String, usize>,
+        agent_wire_apis: Option<&[WireApi]>,
+    ) -> String {
+        let selected = self.selected_variant(selected_wire_apis, agent_wire_apis);
         format!(
             "{:<24} {:>7} {:>7} {:>6}  {:<11} {:>8}  {}",
             self.id,
@@ -1039,6 +1043,9 @@ fn prepare_codex_launch_home_for_app(
     write_private_file(&codex_dir.join("config.toml"), &merged_config)?;
     println!("[cx] 注入配置: {}", codex_dir.join("config.toml").display());
 
+    if apikey.is_empty() {
+        anyhow::bail!("Codex.app 需要 API Key，但未提供");
+    }
     env.insert("CODEX_HOME".into(), codex_dir.display().to_string());
     env.insert("DASHSCOPE_API_KEY".into(), apikey);
     Ok(())
@@ -3273,7 +3280,7 @@ impl AppState {
             Step::Model => self
                 .current_model_options(models)
                 .iter()
-                .map(|model| model.formatted_row(&self.model_wire_api_indexes))
+                .map(|model| model.formatted_row(&self.model_wire_api_indexes, Some(&self.agent_wire_apis())))
                 .collect(),
         }
     }
@@ -4419,7 +4426,7 @@ mod tests {
         assert_eq!(options[0].variants[1].wire_api, WireApi::Completions);
         assert!(
             options[0]
-                .formatted_row(&BTreeMap::new())
+                .formatted_row(&BTreeMap::new(), None)
                 .contains("anthropic")
         );
     }
