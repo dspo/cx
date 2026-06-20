@@ -8,6 +8,11 @@
 //! - `type: "compaction"` 等非 message 类型不含 per-message usage，跳过
 //!
 //! 口径：raw-sum（不按 message id 去重），与 OMP/Claude 保持一致。
+//!
+//! 注意：session_id 从 `type: "session"` header 行提取。append-scan 只解析
+//! 文件尾部，看不到 header，因此追加部分的 session_id 为 None。此字段仅
+//! 用于信息展示和溯源，不参与去重或聚合，所以可接受；source_path 列已
+//! 可唯一标识 session 来源。
 
 use serde_json::Value;
 
@@ -172,5 +177,17 @@ mod tests {
     fn skips_model_change_entries() {
         let line = r#"{"type":"model_change","id":"mc1","parentId":"p1","timestamp":"2026-06-19T16:04:52.234Z","provider":"dashscope","modelId":"qwen3.7-max"}"#;
         assert!(parse(line).is_empty());
+    }
+
+    #[test]
+    fn later_session_header_overrides_first() {
+        let content = r#"{"type":"session","version":3,"id":"sess-1","timestamp":"2026-06-19T16:00:00.000Z","cwd":"/test"}
+{"type":"message","id":"m1","timestamp":"2026-06-19T12:00:00.000Z","message":{"role":"assistant","model":"qwen3.7-max","usage":{"input":100,"output":50,"cacheRead":0,"cacheWrite":0}}}
+{"type":"session","version":3,"id":"sess-2","timestamp":"2026-06-19T17:00:00.000Z","cwd":"/test"}
+{"type":"message","id":"m2","timestamp":"2026-06-19T12:00:00.000Z","message":{"role":"assistant","model":"qwen3.7-max","usage":{"input":200,"output":100,"cacheRead":0,"cacheWrite":0}}}"#;
+        let entries = parse(content);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].session_id, Some("sess-1".to_string()));
+        assert_eq!(entries[1].session_id, Some("sess-2".to_string()));
     }
 }
