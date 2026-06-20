@@ -30,6 +30,7 @@ use url::Url;
 
 mod stats;
 mod probe;
+mod warp;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROVIDER_CONFIG_FILE_NAME: &str = "cx.providers.config.yaml";
@@ -1384,12 +1385,8 @@ fn run_launcher(
 
     let spec = build_launch_spec(&selection, &passthrough_args)?;
 
-    println!();
-    println!("{}", spec.summary);
-    println!();
-
     apply_selected_model_tab_name(&selection)?;
-    exec_launch(spec)
+    launch_agent(spec)
 }
 fn apply_selected_model_tab_name(selection: &Selection) -> Result<()> {
     let Some(model_id) = selection
@@ -1808,7 +1805,7 @@ fn resolve_apikey_interactive(source: &str) -> Result<String> {
     }
 }
 
-fn exec_launch(spec: LaunchSpec) -> Result<()> {
+fn launch_agent(spec: LaunchSpec) -> Result<()> {
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
     for name in &spec.env_remove {
@@ -1836,19 +1833,115 @@ fn exec_launch(spec: LaunchSpec) -> Result<()> {
         }
     }
 
-    // CLI: exec replaces current process
-    #[cfg(unix)]
-    {
-        let error = command.exec();
-        Err(anyhow!("启动 `{}` 失败: {error}", spec.program.display()))
+    // Warp 集成：在启动 agent 前发出 session_start 事件
+    let warp_session = warp::maybe_emit_session_start(
+        &spec.agent_id,
+        spec.model_id.as_deref(),
+    );
+
+    // 将 Warp session ID 传递给子进程，以便 agent 的 hooks/plugins
+    // 可以使用同一 session ID 发出后续 OSC 777 事件。
+    if let Some(ref session) = warp_session {
+        command.env("CX_WARP_SESSION_ID", session.session_id());
     }
 
-    #[cfg(not(unix))]
-    {
-        let status = command
-            .status()
-            .with_context(|| format!("启动 `{}` 失败", spec.program.display()))?;
-        std::process::exit(status.code().unwrap_or(1));
+    // 打印启动摘要
+    println!();
+    println!("{}", spec.summary);
+    println!();
+
+    let started_at = std::time::Instant::now();
+    let started_sys = std::time::SystemTime::now();
+
+    // spawn + wait：子进程继承 stdin/stdout/stderr，cx 作为静默父进程等待。
+    // 信号（SIGINT/SIGWINCH）通过进程组自然传递给子进程。
+    let status = command
+        .status()
+        .with_context(|| format!("启动 `{}` 失败", spec.program.display()))?;
+
+    let duration = started_at.elapsed();
+
+    // 从 agent 日志中提取本次会话的 token 用量
+    let tokens = stats::count_recent_session_tokens(&spec.agent_id, started_sys);
+
+    // 打印退出摘要
+    println!();
+    println!(
+        "{}",
+        format_exit_summary(&spec, duration, status.code(), tokens.as_ref())
+    );
+    println!();
+
+    // Warp 集成：agent 退出后发出 stop 事件
+    if let Some(ref session) = warp_session {
+        session.emit_stop(status.code());
+    }
+
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// 格式化退出摘要，包含 agent 信息、会话时长和 token 用量。
+///
+/// 示例：`退出 claude | Provider: 百炼 | Model: MiniMax-M2.7 | 3m12s | 123k Tokens`
+fn format_exit_summary(
+    spec: &LaunchSpec,
+    duration: std::time::Duration,
+    exit_code: Option<i32>,
+    tokens: Option<&stats::SessionTokens>,
+) -> String {
+    let dur_str = format_duration(duration);
+    let mut msg = format!(
+        "退出 {} | Provider: {} | {}",
+        spec.agent_id,
+        spec.provider_name,
+        match &spec.model_id {
+            Some(m) => format!("Model: {m}"),
+            None => "Model: default".into(),
+        },
+    );
+    msg.push_str(" | ");
+    msg.push_str(&dur_str);
+    if let Some(t) = tokens {
+        let total = t.total();
+        if total > 0 {
+            msg.push_str(" | ");
+            msg.push_str(&stats::format_tokens_compact(total));
+            msg.push_str(" Tokens");
+        }
+    }
+    if let Some(code) = exit_code {
+        if code != 0 {
+            msg.push_str(&format!(" | exit {code}"));
+        }
+    }
+    msg
+}
+
+/// 将时长格式化为人类友好的简短表示。
+///
+/// - < 1 分钟: "45s"
+/// - < 1 小时: "3m12s"
+/// - ≥ 1 小时: "1h5m"
+fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        let m = secs / 60;
+        let s = secs % 60;
+        if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m{s}s")
+        }
+    } else {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h{m}m")
+        }
     }
 }
 
@@ -1860,6 +1953,12 @@ struct LaunchSpec {
     summary: String,
     detach: bool,
     env_remove: Vec<String>,
+    /// Agent 标识符（如 "claude"、"codex"、"copilot"），供 Warp 集成和退出摘要使用。
+    agent_id: String,
+    /// Provider 名称，供退出摘要使用。
+    provider_name: String,
+    /// 选中的模型 ID，供 Warp 集成和退出摘要使用。
+    model_id: Option<String>,
 }
 
 fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Result<LaunchSpec> {
@@ -2004,6 +2103,9 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
         summary,
         detach: false,
         env_remove,
+        agent_id: agent_id.clone(),
+        provider_name: provider.name.clone(),
+        model_id: selection.model.as_ref().map(|m| m.id.clone()),
     })
 }
 
@@ -4698,5 +4800,121 @@ trust_level = "trusted"
         let path = resolve_binary(&fake_binary.display().to_string()).unwrap();
         assert_eq!(path, fake_binary);
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn format_duration_seconds_only() {
+        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(format_duration(Duration::from_secs(45)), "45s");
+        assert_eq!(format_duration(Duration::from_secs(59)), "59s");
+    }
+
+    #[test]
+    fn format_duration_minutes_and_seconds() {
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m");
+        assert_eq!(format_duration(Duration::from_secs(90)), "1m30s");
+        assert_eq!(format_duration(Duration::from_secs(192)), "3m12s");
+        assert_eq!(format_duration(Duration::from_secs(3599)), "59m59s");
+    }
+
+    #[test]
+    fn format_duration_hours_and_minutes() {
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1h");
+        assert_eq!(format_duration(Duration::from_secs(3660)), "1h1m");
+        assert_eq!(format_duration(Duration::from_secs(7200)), "2h");
+        assert_eq!(format_duration(Duration::from_secs(5400)), "1h30m");
+    }
+
+    #[test]
+    fn format_exit_summary_with_model() {
+        let spec = LaunchSpec {
+            program: PathBuf::from("/usr/bin/claude"),
+            args: vec![],
+            env: BTreeMap::new(),
+            summary: String::new(),
+            detach: false,
+            env_remove: vec![],
+            agent_id: "claude".into(),
+            provider_name: "百炼".into(),
+            model_id: Some("MiniMax-M2.7".into()),
+        };
+        let msg = format_exit_summary(&spec, Duration::from_secs(192), Some(0), None);
+        assert_eq!(msg, "退出 claude | Provider: 百炼 | Model: MiniMax-M2.7 | 3m12s");
+    }
+
+    #[test]
+    fn format_exit_summary_without_model() {
+        let spec = LaunchSpec {
+            program: PathBuf::from("/usr/bin/copilot"),
+            args: vec![],
+            env: BTreeMap::new(),
+            summary: String::new(),
+            detach: false,
+            env_remove: vec![],
+            agent_id: "copilot".into(),
+            provider_name: "default".into(),
+            model_id: None,
+        };
+        let msg = format_exit_summary(&spec, Duration::from_secs(45), Some(0), None);
+        assert_eq!(msg, "退出 copilot | Provider: default | Model: default | 45s");
+    }
+
+    #[test]
+    fn format_exit_summary_nonzero_exit_code() {
+        let spec = LaunchSpec {
+            program: PathBuf::from("/usr/bin/codex"),
+            args: vec![],
+            env: BTreeMap::new(),
+            summary: String::new(),
+            detach: false,
+            env_remove: vec![],
+            agent_id: "codex".into(),
+            provider_name: "DashScope".into(),
+            model_id: Some("qwen-max".into()),
+        };
+        let msg = format_exit_summary(&spec, Duration::from_secs(10), Some(1), None);
+        assert_eq!(
+            msg,
+            "退出 codex | Provider: DashScope | Model: qwen-max | 10s | exit 1"
+        );
+    }
+
+    #[test]
+    fn format_exit_summary_with_tokens() {
+        let spec = LaunchSpec {
+            program: PathBuf::from("/usr/bin/claude"),
+            args: vec![],
+            env: BTreeMap::new(),
+            summary: String::new(),
+            detach: false,
+            env_remove: vec![],
+            agent_id: "claude".into(),
+            provider_name: "百炼".into(),
+            model_id: Some("MiniMax-M2.7".into()),
+        };
+        let tokens = stats::SessionTokens {
+            input: 100_000,
+            output: 23_000,
+            cache_read: 50_000,
+            cache_creation: 10_000,
+        };
+        let msg = format_exit_summary(&spec, Duration::from_secs(192), Some(0), Some(&tokens));
+        assert_eq!(
+            msg,
+            "退出 claude | Provider: 百炼 | Model: MiniMax-M2.7 | 3m12s | 123k Tokens"
+        );
+    }
+
+    #[test]
+    fn format_tokens_compact_cases() {
+        assert_eq!(stats::format_tokens_compact(0), "0");
+        assert_eq!(stats::format_tokens_compact(500), "500");
+        assert_eq!(stats::format_tokens_compact(1_000), "1k");
+        assert_eq!(stats::format_tokens_compact(1_500), "1.5k");
+        assert_eq!(stats::format_tokens_compact(12_300), "12k");
+        assert_eq!(stats::format_tokens_compact(123_000), "123k");
+        assert_eq!(stats::format_tokens_compact(1_000_000), "1m");
+        assert_eq!(stats::format_tokens_compact(3_123_000), "3m123k");
+        assert_eq!(stats::format_tokens_compact(10_500_000), "10m500k");
     }
 }
