@@ -20,7 +20,7 @@ use std::io::{self, Write as IoWrite};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 #[cfg(windows)]
 use std::os::windows::fs::{symlink_dir, symlink_file};
 use std::path::{Path, PathBuf};
@@ -1854,7 +1854,11 @@ fn launch_agent(spec: LaunchSpec) -> Result<()> {
     let started_sys = std::time::SystemTime::now();
 
     // spawn + wait：子进程继承 stdin/stdout/stderr，cx 作为静默父进程等待。
-    // 信号（SIGINT/SIGWINCH）通过进程组自然传递给子进程。
+    //
+    // 信号行为：SIGINT/SIGWINCH 通过前台进程组自然传递给子进程和 cx 双方。
+    // 已知限制：若用户在 agent 运行时按 Ctrl+C，Rust 默认 SIGINT handler 会
+    // 立即终止 cx 进程，此时退出摘要和 Warp stop 事件不会触发。这是 spawn+wait
+    // 模式相对于 exec() 的固有代价；完整信号转发需要 signal-hook 等额外依赖。
     let status = command
         .status()
         .with_context(|| format!("启动 `{}` 失败", spec.program.display()))?;
@@ -1865,19 +1869,48 @@ fn launch_agent(spec: LaunchSpec) -> Result<()> {
     let tokens = stats::count_recent_session_tokens(&spec.agent_id, started_sys);
 
     // 打印退出摘要
+    let termination = format_exit_status(&status);
     println!();
     println!(
         "{}",
-        format_exit_summary(&spec, duration, status.code(), tokens.as_ref())
+        format_exit_summary(&spec, duration, termination.as_deref(), tokens.as_ref())
     );
     println!();
 
-    // Warp 集成：agent 退出后发出 stop 事件
+    // Warp 集成：agent 退出后发出 stop 事件（WarpSession 的 Drop 也会兜底）
     if let Some(ref session) = warp_session {
         session.emit_stop(status.code());
     }
 
-    std::process::exit(status.code().unwrap_or(1));
+    // 退出码：正常退出用 exit code，信号终止用 128+signal（与 shell 惯例一致）
+    let exit_code = status.code().unwrap_or_else(|| {
+        #[cfg(unix)]
+        {
+            status.signal().map(|s| 128 + s).unwrap_or(1)
+        }
+        #[cfg(not(unix))]
+        {
+            1
+        }
+    });
+    std::process::exit(exit_code);
+}
+
+/// 将 `ExitStatus` 转换为人类可读的终止描述。
+///
+/// - 正常退出 (code 0): `None`（不显示）
+/// - 非零退出码: `Some("exit 1")`
+/// - 信号终止 (Unix): `Some("signal 9")`
+fn format_exit_status(status: &std::process::ExitStatus) -> Option<String> {
+    #[cfg(unix)]
+    if let Some(sig) = status.signal() {
+        return Some(format!("signal {sig}"));
+    }
+    match status.code() {
+        Some(0) => None,
+        Some(code) => Some(format!("exit {code}")),
+        None => None,
+    }
 }
 
 /// 格式化退出摘要，包含 agent 信息、会话时长和 token 用量。
@@ -1886,7 +1919,7 @@ fn launch_agent(spec: LaunchSpec) -> Result<()> {
 fn format_exit_summary(
     spec: &LaunchSpec,
     duration: std::time::Duration,
-    exit_code: Option<i32>,
+    termination: Option<&str>,
     tokens: Option<&stats::SessionTokens>,
 ) -> String {
     let dur_str = format_duration(duration);
@@ -1909,10 +1942,8 @@ fn format_exit_summary(
             msg.push_str(" Tokens");
         }
     }
-    if let Some(code) = exit_code {
-        if code != 0 {
-            msg.push_str(&format!(" | exit {code}"));
-        }
+    if let Some(term) = termination {
+        msg.push_str(&format!(" | {term}"));
     }
     msg
 }
@@ -4838,7 +4869,7 @@ trust_level = "trusted"
             provider_name: "百炼".into(),
             model_id: Some("MiniMax-M2.7".into()),
         };
-        let msg = format_exit_summary(&spec, Duration::from_secs(192), Some(0), None);
+        let msg = format_exit_summary(&spec, Duration::from_secs(192), None, None);
         assert_eq!(msg, "退出 claude | Provider: 百炼 | Model: MiniMax-M2.7 | 3m12s");
     }
 
@@ -4855,7 +4886,7 @@ trust_level = "trusted"
             provider_name: "default".into(),
             model_id: None,
         };
-        let msg = format_exit_summary(&spec, Duration::from_secs(45), Some(0), None);
+        let msg = format_exit_summary(&spec, Duration::from_secs(45), None, None);
         assert_eq!(msg, "退出 copilot | Provider: default | Model: default | 45s");
     }
 
@@ -4872,10 +4903,30 @@ trust_level = "trusted"
             provider_name: "DashScope".into(),
             model_id: Some("qwen-max".into()),
         };
-        let msg = format_exit_summary(&spec, Duration::from_secs(10), Some(1), None);
+        let msg = format_exit_summary(&spec, Duration::from_secs(10), Some("exit 1"), None);
         assert_eq!(
             msg,
             "退出 codex | Provider: DashScope | Model: qwen-max | 10s | exit 1"
+        );
+    }
+
+    #[test]
+    fn format_exit_summary_signal_killed() {
+        let spec = LaunchSpec {
+            program: PathBuf::from("/usr/bin/claude"),
+            args: vec![],
+            env: BTreeMap::new(),
+            summary: String::new(),
+            detach: false,
+            env_remove: vec![],
+            agent_id: "claude".into(),
+            provider_name: "Anthropic".into(),
+            model_id: Some("opus-4.7".into()),
+        };
+        let msg = format_exit_summary(&spec, Duration::from_secs(5), Some("signal 9"), None);
+        assert_eq!(
+            msg,
+            "退出 claude | Provider: Anthropic | Model: opus-4.7 | 5s | signal 9"
         );
     }
 
@@ -4898,7 +4949,7 @@ trust_level = "trusted"
             cache_read: 50_000,
             cache_creation: 10_000,
         };
-        let msg = format_exit_summary(&spec, Duration::from_secs(192), Some(0), Some(&tokens));
+        let msg = format_exit_summary(&spec, Duration::from_secs(192), None, Some(&tokens));
         assert_eq!(
             msg,
             "退出 claude | Provider: 百炼 | Model: MiniMax-M2.7 | 3m12s | 123k Tokens"

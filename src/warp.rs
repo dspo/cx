@@ -10,6 +10,7 @@
 
 use rand::RngCore;
 use serde::Serialize;
+use std::cell::Cell;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -44,10 +45,14 @@ struct AgentEvent {
 }
 
 /// Warp 会话句柄，持有 session 标识以便发出配对的 start/stop 事件。
+///
+/// 实现 `Drop`：当 `WarpSession` 被丢弃时（包括 panic 导致的提前退出），
+/// 自动发出 `stop` 事件，确保 Warp 侧边栏不会残留 "running" 状态。
 pub struct WarpSession {
     agent_id: String,
     session_id: String,
     model: Option<String>,
+    stopped: Cell<bool>,
 }
 
 impl WarpSession {
@@ -58,8 +63,13 @@ impl WarpSession {
 
     /// 发出 stop 事件，表示 agent 会话结束。
     ///
+    /// 幂等：多次调用只发出一次事件。
     /// `exit_code` 为 agent 进程的退出码；异常退出（信号终止等）时为 `None`。
     pub fn emit_stop(&self, exit_code: Option<i32>) {
+        if self.stopped.get() {
+            return;
+        }
+        self.stopped.set(true);
         emit_event(&AgentEvent {
             v: 1,
             agent: self.agent_id.clone(),
@@ -70,6 +80,23 @@ impl WarpSession {
             model: self.model.clone(),
             exit_code,
         });
+    }
+}
+
+impl Drop for WarpSession {
+    fn drop(&mut self) {
+        if !self.stopped.get() {
+            emit_event(&AgentEvent {
+                v: 1,
+                agent: self.agent_id.clone(),
+                event: "stop".into(),
+                session_id: self.session_id.clone(),
+                cwd: cwd_string(),
+                project: project_name(),
+                model: self.model.clone(),
+                exit_code: None,
+            });
+        }
     }
 }
 
@@ -90,6 +117,7 @@ pub fn maybe_emit_session_start(
         agent_id: agent_id.to_string(),
         session_id,
         model: model.map(|s| s.to_string()),
+        stopped: Cell::new(false),
     };
 
     emit_event(&AgentEvent {
