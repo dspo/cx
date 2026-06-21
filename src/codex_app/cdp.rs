@@ -42,13 +42,22 @@ pub async fn wait_for_page_target(debug_port: u16, timeout: Duration) -> Result<
         .timeout(Duration::from_secs(2))
         .build()?;
     let deadline = Instant::now() + timeout;
+    let mut got_http = false; // 是否曾成功连到端口（区分「端口没人监听」与「监听了但非 Codex CDP」）
     loop {
         if Instant::now() >= deadline {
+            if got_http {
+                return Err(anyhow!(
+                    "端口 {debug_port} 有进程在监听，但未返回 Codex page target——\
+                     该端口可能被其它程序（如 Chrome）占用，而非 Codex.app 的调试端口"
+                ));
+            }
             return Err(anyhow!(
-                "等待 Codex.app CDP 就绪超时（端口 {debug_port}），App 是否已安装并启动？"
+                "等待 Codex.app CDP 就绪超时（端口 {debug_port} 无响应）：\
+                 App 可能未启动、崩溃，或不支持远程调试端口"
             ));
         }
         if let Ok(resp) = client.get(&list_url).send().await {
+            got_http = true;
             if let Ok(targets) = resp.json::<Vec<Value>>().await {
                 for target in &targets {
                     if target.get("type").and_then(|v| v.as_str()) == Some("page") {

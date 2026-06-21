@@ -182,7 +182,8 @@ fn resolve_codex_binary() -> Result<PathBuf> {
         .output()
         .context("读取 Codex.app CFBundleExecutable 失败")?;
     if !output.status.success() {
-        bail!("解析 Codex.app CFBundleExecutable 失败");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("解析 Codex.app CFBundleExecutable 失败: {}", stderr.trim());
     }
     let exec_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if exec_name.is_empty() {

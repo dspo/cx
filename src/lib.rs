@@ -1014,12 +1014,17 @@ fn env_key_for_apikey_source(source: Option<&str>) -> String {
     "CX_PROVIDER_KEY".to_string()
 }
 
-/// 从既有 config.toml 文本中提取 `model_reasoning_effort` 的值（去引号）。
+/// 从既有 config.toml 文本中提取顶层 `model_reasoning_effort` 的值（去引号）。
 /// 用于在重写 config 时保留用户偏好，而非硬编码覆盖。
+/// 仅匹配任何 `[section]` 之前的顶层键，避免误取 `[model_providers.*]` 等段内同名字段。
 fn extract_reasoning_effort(existing: Option<&str>) -> Option<String> {
     let existing = existing?;
     for line in existing.lines() {
         let trimmed = line.trim();
+        // 进入任意 section 后，顶层键已结束，停止扫描。
+        if trimmed.starts_with('[') {
+            break;
+        }
         if let Some(after) = trimmed.strip_prefix("model_reasoning_effort") {
             let after = after.trim_start();
             if let Some(rhs) = after.strip_prefix('=') {
@@ -1386,7 +1391,14 @@ fn injected_models_for_codex_app(
 ) -> Vec<ResolvedModel> {
     let mut models: Vec<ResolvedModel> = all_models
         .iter()
-        .filter(|m| m.provider_name == provider_name && m.supports_agent("Codex.app"))
+        .filter(|m| {
+            m.provider_name == provider_name
+                && m.supports_agent("Codex.app")
+                // 显式确认模型支持 Responses wire api。supports_agent 已隐含这点
+                // （Codex.app agent 仅兼容 Responses endpoint），但这里再过滤一次，
+                // 防止配置层不变量将来变动时把非 Responses 模型注入、生成错误的 wire_api。
+                && m.model_wire_apis.contains(&WireApi::Responses)
+        })
         .cloned()
         .collect();
     models.sort_by(|a, b| {
@@ -5070,6 +5082,12 @@ trust_level = "trusted"
         );
         assert_eq!(extract_reasoning_effort(Some("model = \"x\"")), None);
         assert_eq!(extract_reasoning_effort(None), None);
+        // 只取顶层键，不误取 [model_providers.*] 段内同名字段
+        let cfg = "model = \"qwen\"\n\n[model_providers.foo]\nmodel_reasoning_effort = \"low\"\n";
+        assert_eq!(extract_reasoning_effort(Some(cfg)), None);
+        // 顶层值存在时正常取，即使后面 section 里也有
+        let cfg2 = "model_reasoning_effort = \"high\"\n\n[model_providers.foo]\nmodel_reasoning_effort = \"low\"\n";
+        assert_eq!(extract_reasoning_effort(Some(cfg2)), Some("high".to_string()));
     }
 
     #[test]
