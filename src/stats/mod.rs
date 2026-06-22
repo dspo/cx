@@ -458,12 +458,12 @@ pub(crate) fn normalize_model_name(model: &str) -> String {
 }
 
 /// 剥离尾部上下文窗口变体后缀，如 `[1m]` / `[3m]`。
-/// 与 probe 模块的 `resolve_api_model_id` 共用同一规则（`\[\d+[m]\]$`），
-/// 这类后缀表示同模型的上下文长度变体，不应当作独立模型。
+/// 正则与 probe 模块的 `resolve_api_model_id` 相同（`\[\d+m\]$`，大小写不敏感），
+/// 但当后缀是字符串全部内容时（如 `[1m]`）保留原样，避免产生空模型名。
 fn strip_context_variant_suffix(model: &str) -> &str {
     use regex::Regex;
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"\[\d+[m]\]$").unwrap());
+    let re = RE.get_or_init(|| Regex::new(r"(?i)\[\d+m\]$").unwrap());
     match re.find(model) {
         Some(m) if m.start() > 0 => &model[..m.start()],
         _ => model,
@@ -546,6 +546,8 @@ mod tests {
         assert_eq!(normalize_model_name("glm-5.2[1m]"), "glm-5.2");
         assert_eq!(normalize_model_name("gpt-4o[3m]"), "gpt-4o");
         assert_eq!(normalize_model_name("gpt-5.4[1m]"), "gpt-5.4");
+        // 大小写不敏感
+        assert_eq!(normalize_model_name("glm-5.2[1M]"), "glm-5.2");
     }
 
     #[test]
@@ -563,5 +565,7 @@ mod tests {
         assert_eq!(normalize_model_name("model[1mm]"), "model[1mm]");
         assert_eq!(normalize_model_name("[1m]"), "[1m]");
         assert_eq!(normalize_model_name("model"), "model");
+        // 空串不应崩溃
+        assert_eq!(normalize_model_name(""), "");
     }
 }
