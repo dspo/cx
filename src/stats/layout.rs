@@ -40,7 +40,7 @@ const PERIOD_LABELS: &[&str] = &[
     "Today",
     "Yesterday",
     "Last 7 days",
-    "Last 31 days",
+    "Last month",
     "All time",
 ];
 
@@ -223,7 +223,7 @@ fn footer_bar(y_offset: u32) -> String {
     // top border
     svg.push_str(&ov_line(0, y, OV_WIDTH, y, palette::BORDER, 1.0));
     // period hint text
-    let hint = "1 Today  2 Yesterday  3 Last 7 days  4 Last 31 days  5 All time";
+    let hint = "1 Today  2 Yesterday  3 Last 7 days  4 Last month  5 All time";
     svg.push_str(&ov_text(
         16,
         y + FOOTER_H / 2 + 4,
@@ -243,7 +243,7 @@ fn footer_bar(y_offset: u32) -> String {
 /// - `suffix`: footer + `</svg>`
 /// - 调用方在两者之间插入 chart + table 等内容。
 ///
-/// `active_period_idx` 范围 0–4，对应 Today/Yesterday/7d/31d/All。
+/// `active_period_idx` 范围 0–4，对应 Today/Yesterday/7d/month/All。
 pub(super) fn ov_document(
     title: &str,
     period_label: &str,
@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn race_document_contains_title_subtitle() {
-        let (prefix, suffix) = race_document("Model Tokens", "Rolling 7 days in Last 31 days");
+        let (prefix, suffix) = race_document("Model Tokens", "Rolling 7 days in Last month");
         assert!(prefix.contains("<svg"));
         assert!(prefix.contains("<style>"));
         assert!(prefix.contains(&format!("width=\"{RACE_WIDTH}\"")));
