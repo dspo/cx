@@ -278,7 +278,6 @@ pub(super) fn render_table(
 /// 计算表格所需总高度（像素）。
 ///
 /// Computes the expected table height in pixels for a given number of model rows.
-#[allow(dead_code)]
 pub(super) fn table_height(row_count: usize) -> f64 {
     18.0 + HEADER_HEIGHT + 4.0 + row_count as f64 * ROW_HEIGHT + 2.0 + 4.0
 }

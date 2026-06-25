@@ -323,9 +323,9 @@ pub(super) fn area_chart(
     top: &[String],
     today: &str,
     _period: super::types::Period,
+    bounds: &PlotBounds,
 ) -> String {
     use super::date;
-    use super::layout;
 
     // ── 1. 确定日期范围 ────────────────────────────────────
     let mut dates_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -388,21 +388,6 @@ pub(super) fn area_chart(
         let color = palette::SVG_COLORS[color_idx].to_string();
         series.push((model.clone(), values, color));
     }
-
-    // ── 4. 确定绘图区域边界 ────────────────────────────────
-    // 使用 layout::OV_MARGIN + 合理的 chart 区域
-    let margin = layout::OV_MARGIN;
-    let chart_top = margin.top; // 80 (header + period tabs + gap)
-    let chart_bottom = layout::OV_HEIGHT - margin.bottom - 200; // 留空间给 summary + table
-    let chart_left = margin.left; // 80
-    let chart_right = layout::OV_WIDTH - margin.right; // 1080
-
-    let bounds = PlotBounds {
-        left: chart_left,
-        right: chart_right,
-        top: chart_top,
-        bottom: chart_bottom,
-    };
 
     render_area_chart(&series, &all_dates, max_y, &bounds)
 }

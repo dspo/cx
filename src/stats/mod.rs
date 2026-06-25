@@ -575,11 +575,27 @@ fn render_overview(records: &[UsageRecord], today: &str, period: types::Period) 
     let period_idx = period_to_tab_index(period);
     let period_label = period.label(today);
     let (prefix, suffix) = layout::ov_document("CX Stats", &period_label, period_idx);
-    let chart_svg = chart::area_chart(&filtered, &top, today, period);
+    // 动态计算 chart 和 table 的垂直布局
+    let row_count = top.len();
+    let table_h = table::table_height(row_count);
+    // chart_bottom = 画布高度 - footer - gap - table - gap - x_axis_labels
+    let chart_bottom: u32 = layout::OV_HEIGHT
+        - layout::FOOTER_H
+        - layout::SECTION_GAP
+        - table_h as u32
+        - layout::SECTION_GAP
+        - layout::X_AXIS_LABEL_H;
+    let bounds = chart::PlotBounds {
+        left: layout::OV_MARGIN.left,
+        right: layout::OV_WIDTH - layout::OV_MARGIN.right,
+        top: layout::OV_MARGIN.top,
+        bottom: chart_bottom,
+    };
+    let chart_svg = chart::area_chart(&filtered, &top, today, period, &bounds);
 
-    // table_bounds: (x_offset, y_offset, available_width)
+    // table 从 chart 下方 + x_axis_labels + gap 开始
     let tbl_x = layout::OV_MARGIN.left as f64;
-    let tbl_y = 480.0; // approximate y offset after chart area
+    let tbl_y = chart_bottom as f64 + layout::X_AXIS_LABEL_H as f64 + layout::SECTION_GAP as f64;
     let tbl_w = (layout::OV_WIDTH - layout::OV_MARGIN.left - layout::OV_MARGIN.right) as f64;
     let table_svg = table::model_table(&top, &totals, &cells, MATRIX_AGENTS, (tbl_x, tbl_y, tbl_w));
 

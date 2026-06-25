@@ -15,6 +15,7 @@ pub(super) const OV_HEIGHT: u32 = 900;
 /// Overview 内边距。
 ///
 /// top = header(44) + period_tabs(28) + gap(8) = 80
+#[allow(dead_code)]
 pub(super) struct OvMargin {
     pub(super) top: u32,
     pub(super) bottom: u32,
@@ -48,7 +49,11 @@ const PERIOD_LABELS: &[&str] = &[
 
 const HEADER_H: u32 = 44;
 const PERIOD_TABS_H: u32 = 28;
-const FOOTER_H: u32 = 36;
+pub(super) const FOOTER_H: u32 = 36;
+/// X 轴日期标签高度（px）。
+pub(super) const X_AXIS_LABEL_H: u32 = 18;
+/// 区域间间距（px）。
+pub(super) const SECTION_GAP: u32 = 12;
 
 // ── CSS style block ──────────────────────────────────────────
 
