@@ -54,15 +54,3 @@ pub(super) fn top_models_covering(
     }
     out
 }
-
-/// 返回所有 total_tokens > 0 的模型名，按 total_tokens 降序排列。
-/// 与 TUI draw_model_table 的排序逻辑一致。
-pub(super) fn all_models_sorted(totals: &HashMap<String, UsageTotals>) -> Vec<String> {
-    let mut v: Vec<(String, u64)> = totals
-        .iter()
-        .filter(|(_, usage)| usage.total_tokens() > 0)
-        .map(|(k, usage)| (k.clone(), usage.total_tokens()))
-        .collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    v.into_iter().map(|(m, _)| m).collect()
-}

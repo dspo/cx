@@ -570,7 +570,7 @@ fn render_overview(records: &[UsageRecord], today: &str, period: types::Period) 
         .collect();
     let totals = aggregate::totals_by_model(&filtered);
     let cells = aggregate::totals_by_agent_model(&filtered);
-    let top = aggregate::all_models_sorted(&totals);
+    let top = aggregate::top_models_covering(&totals, 0.90);
 
     let period_idx = period_to_tab_index(period);
     let period_label = period.label(today);
@@ -600,7 +600,7 @@ fn render_overview(records: &[UsageRecord], today: &str, period: types::Period) 
 
     let tbl_x = layout::OV_MARGIN.left as f64;
     let tbl_y = chart_bottom as f64 + layout::X_AXIS_LABEL_H as f64 + layout::SECTION_GAP as f64;
-    let tbl_w = (layout::OV_WIDTH - layout::OV_MARGIN.left - layout::OV_MARGIN.right) as f64;
+    let tbl_w = (layout::OV_WIDTH - layout::OV_MARGIN.left - 24) as f64;
     let table_svg = table::model_table(&top, &totals, &cells, MATRIX_AGENTS, (tbl_x, tbl_y, tbl_w));
 
     Ok(format!("{prefix}{chart_svg}{table_svg}{suffix}"))
