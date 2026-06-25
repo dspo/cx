@@ -98,9 +98,9 @@ impl StatsPeriod {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "today" => Some(Self::Today),
-            "yesterday" | "lastday" => Some(Self::Yesterday),
-            "7" | "last7" | "last-7" => Some(Self::Last7),
-            "30" | "last30" | "last-30" => Some(Self::Last30),
+            "yesterday" | "lastday" | "yda" => Some(Self::Yesterday),
+            "7" | "7d" | "last7" | "last-7" => Some(Self::Last7),
+            "30" | "30d" | "31" | "31d" | "last30" | "last-30" => Some(Self::Last30),
             "all" => Some(Self::All),
             _ => None,
         }
