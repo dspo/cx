@@ -8,15 +8,24 @@
 //! 聚合用 SQL GROUP BY 实时计算，不需要单独的聚合表。
 
 mod aggregate;
+mod chart;
 mod date;
 mod db;
 mod format;
+#[cfg(feature = "image-output")]
+mod image;
+mod layout;
+mod palette;
 mod parser;
+mod race;
+mod table;
 mod tui;
 mod types;
 mod view;
 
 use anyhow::Result;
+#[cfg(not(feature = "image-output"))]
+use anyhow::anyhow;
 use dirs::home_dir;
 use ratatui::style::Color;
 use std::collections::BTreeSet;
@@ -29,6 +38,92 @@ use std::time::UNIX_EPOCH;
 
 use parser::{SourceKind, parse_file, parse_file_from_offset};
 use types::UsageRecord;
+
+/// 统计输出格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Svg,
+    Png,
+    Jpg,
+}
+
+impl OutputFormat {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "svg" => Some(Self::Svg),
+            "png" => Some(Self::Png),
+            "jpg" | "jpeg" => Some(Self::Jpg),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "image-output")]
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpg => "jpg",
+            Self::Svg => "svg",
+        }
+    }
+}
+
+/// 统计视图。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsView {
+    Overview,
+    Race,
+}
+
+impl StatsView {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "overview" => Some(Self::Overview),
+            "race" => Some(Self::Race),
+            _ => None,
+        }
+    }
+}
+
+/// 统计时间区间。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsPeriod {
+    Today,
+    Yesterday,
+    Last7,
+    Last30,
+    All,
+}
+
+impl StatsPeriod {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "today" => Some(Self::Today),
+            "yesterday" | "lastday" => Some(Self::Yesterday),
+            "7" | "last7" | "last-7" => Some(Self::Last7),
+            "30" | "last30" | "last-30" => Some(Self::Last30),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    fn to_period(self) -> types::Period {
+        match self {
+            Self::Today => types::Period::Today,
+            Self::Yesterday => types::Period::Lastday,
+            Self::Last7 => types::Period::Last7,
+            Self::Last30 => types::Period::Last30,
+            Self::All => types::Period::All,
+        }
+    }
+}
+
+/// 图片输出配置。
+#[derive(Debug, Clone, Default)]
+pub struct StatsOutputConfig {
+    pub output_format: Option<OutputFormat>,
+    pub view: Option<StatsView>,
+    pub period: Option<StatsPeriod>,
+}
 
 pub(crate) const AGENT_CLAUDE: &str = "claude";
 pub(crate) const AGENT_CODEX: &str = "codex";
@@ -297,7 +392,7 @@ pub(crate) fn format_tokens_compact(n: u64) -> String {
     }
 }
 
-pub fn run_stats() -> Result<()> {
+pub fn run_stats(config: StatsOutputConfig) -> Result<()> {
     let today = date::today_date_string()?;
 
     let db_path = db::db_path()?;
@@ -411,7 +506,89 @@ pub fn run_stats() -> Result<()> {
         return dump_records(&records, &today);
     }
 
-    tui::run_tui(records, today)
+    let period = config
+        .period
+        .map(|p| p.to_period())
+        .unwrap_or(types::Period::Last7);
+    match config.output_format {
+        None => tui::run_tui(records, today),
+        Some(format) => {
+            let svg = render_to_string(&records, &today, period, config.view)?;
+            match format {
+                OutputFormat::Svg => {
+                    println!("{svg}");
+                    Ok(())
+                }
+                OutputFormat::Png | OutputFormat::Jpg => {
+                    #[cfg(feature = "image-output")]
+                    {
+                        let ext = format.extension();
+                        let path = PathBuf::from(format!("cx-stats.{ext}"));
+                        image::render_to_image(&svg, format, &path)?;
+                        Ok(())
+                    }
+                    #[cfg(not(feature = "image-output"))]
+                    {
+                        Err(anyhow!(
+                            "PNG/JPG output requires the `image-output` feature"
+                        ))?
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_to_string(
+    records: &[UsageRecord],
+    today: &str,
+    period: types::Period,
+    view: Option<StatsView>,
+) -> Result<String> {
+    let view = view.unwrap_or(StatsView::Overview);
+    match view {
+        StatsView::Overview => render_overview(records, today, period),
+        StatsView::Race => render_race(records, today, period),
+    }
+}
+
+/// Map Period enum to period tab index (0–4) used by layout::ov_document.
+fn period_to_tab_index(period: types::Period) -> usize {
+    match period {
+        types::Period::Today => 0,
+        types::Period::Lastday => 1,
+        types::Period::Last7 => 2,
+        types::Period::Last30 => 3,
+        types::Period::All => 4,
+    }
+}
+
+fn render_overview(records: &[UsageRecord], today: &str, period: types::Period) -> Result<String> {
+    let filtered: Vec<&UsageRecord> = records
+        .iter()
+        .filter(|r| period.includes(&r.date, today))
+        .collect();
+    let totals = aggregate::totals_by_model(&filtered);
+    let cells = aggregate::totals_by_agent_model(&filtered);
+    let top = aggregate::top_models_covering(&totals, 0.90);
+
+    let period_idx = period_to_tab_index(period);
+    let period_label = period.label(today);
+    let (prefix, suffix) = layout::ov_document("CX Stats", &period_label, period_idx);
+    let chart_svg = chart::area_chart(&filtered, &top, today, period);
+
+    // table_bounds: (x_offset, y_offset, available_width)
+    let tbl_x = layout::OV_MARGIN.left as f64;
+    let tbl_y = 480.0; // approximate y offset after chart area
+    let tbl_w = (layout::OV_WIDTH - layout::OV_MARGIN.left - layout::OV_MARGIN.right) as f64;
+    let table_svg = table::model_table(&top, &totals, &cells, MATRIX_AGENTS, (tbl_x, tbl_y, tbl_w));
+
+    Ok(format!("{prefix}{chart_svg}{table_svg}{suffix}"))
+}
+
+fn render_race(records: &[UsageRecord], today: &str, period: types::Period) -> Result<String> {
+    // race_chart is self-contained: includes its own layout document skeleton.
+    Ok(race::race_chart(records, today, period))
 }
 
 /// 将模型名称归一化为统一的命名风格。

@@ -1471,8 +1471,15 @@ enum CxCommand {
         #[arg(long, conflicts_with_all = ["source", "url"])]
         refresh: bool,
     },
-    /// 查看各 agent × model 的 token 用量统计（TUI）
-    Stats,
+    /// 查看各 agent × model 的 token 用量统计（TUI / 图片输出）
+    Stats {
+        #[arg(long, value_name = "FORMAT")]
+        output: Option<String>,
+        #[arg(long, value_name = "VIEW")]
+        view: Option<String>,
+        #[arg(long, value_name = "PERIOD")]
+        period: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1488,7 +1495,11 @@ enum DispatchCommand {
         url: Option<String>,
         refresh: bool,
     },
-    Stats,
+    Stats {
+        output_format: Option<stats::OutputFormat>,
+        view: Option<stats::StatsView>,
+        period: Option<stats::StatsPeriod>,
+    },
     Launch {
         args: Vec<String>,
     },
@@ -1515,7 +1526,15 @@ fn dispatch_command(raw_args: &[String]) -> DispatchCommand {
                 provider,
                 auto_probe,
             },
-            Some(CxCommand::Stats) => DispatchCommand::Stats,
+            Some(CxCommand::Stats {
+                output,
+                view,
+                period,
+            }) => DispatchCommand::Stats {
+                output_format: output.and_then(|s| stats::OutputFormat::parse(&s)),
+                view: view.and_then(|s| stats::StatsView::parse(&s)),
+                period: period.and_then(|s| stats::StatsPeriod::parse(&s)),
+            },
             None => DispatchCommand::Launch { args: Vec::new() },
         },
         Err(_) => DispatchCommand::Launch {
@@ -1551,7 +1570,18 @@ pub fn run() -> Result<()> {
             let config = load_config()?;
             run_probe(provider, auto_probe, &config)
         }
-        DispatchCommand::Stats => stats::run_stats(),
+        DispatchCommand::Stats {
+            output_format,
+            view,
+            period,
+        } => {
+            let config = stats::StatsOutputConfig {
+                output_format,
+                view,
+                period,
+            };
+            stats::run_stats(config)
+        }
         DispatchCommand::Launch { args } => {
             // No subcommand or an unknown one → treat as Launch with optional agent hint.
             let config = load_config()?;
