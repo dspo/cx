@@ -575,16 +575,15 @@ fn render_overview(records: &[UsageRecord], today: &str, period: types::Period) 
     let period_idx = period_to_tab_index(period);
     let period_label = period.label(today);
     let (prefix, suffix) = layout::ov_document("CX Stats", &period_label, period_idx);
-    // 动态计算 chart 和 table 的垂直布局
+    // 动态计算 chart 和 table 的垂直布局：比例分配，chart 不超过内容区 45%
     let row_count = top.len();
     let table_h = table::table_height(row_count);
-    // chart_bottom = 画布高度 - footer - gap - table - gap - x_axis_labels
-    let chart_bottom: u32 = layout::OV_HEIGHT
-        - layout::FOOTER_H
-        - layout::SECTION_GAP
-        - table_h as u32
-        - layout::SECTION_GAP
-        - layout::X_AXIS_LABEL_H;
+    let content_area: f64 = (layout::OV_HEIGHT - layout::OV_MARGIN.top - layout::FOOTER_H) as f64;
+    let chart_max_cap: f64 = content_area * 0.45; // chart 占内容区上限 45%
+    let chart_available: f64 =
+        content_area - table_h - layout::X_AXIS_LABEL_H as f64 - 2.0 * layout::SECTION_GAP as f64; // chart 可用的最大高度
+    let chart_h: f64 = chart_available.min(chart_max_cap).max(200.0); // 最少 200px
+    let chart_bottom: u32 = (layout::OV_MARGIN.top as f64 + chart_h) as u32;
     let bounds = chart::PlotBounds {
         left: layout::OV_MARGIN.left,
         right: layout::OV_WIDTH - layout::OV_MARGIN.right,
