@@ -10,7 +10,6 @@ use super::palette;
 // ── Overview canvas ──────────────────────────────────────────
 
 pub(super) const OV_WIDTH: u32 = 1200;
-pub(super) const OV_HEIGHT: u32 = 900;
 
 /// Overview 内边距。
 ///
@@ -249,14 +248,13 @@ pub(super) fn ov_document(
     title: &str,
     period_label: &str,
     active_period_idx: usize,
+    height: u32,
 ) -> (String, String) {
     let mut prefix = String::new();
 
     // SVG open tag
     prefix.push_str(&format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{OV_WIDTH}\" height=\"{OV_HEIGHT}\" viewBox=\"0 0 {OV_WIDTH} {OV_HEIGHT}\">\n",
-        OV_WIDTH = OV_WIDTH,
-        OV_HEIGHT = OV_HEIGHT,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{OV_WIDTH}\" height=\"{height}\" viewBox=\"0 0 {OV_WIDTH} {height}\">\n",
     ));
 
     // embedded style
@@ -265,9 +263,9 @@ pub(super) fn ov_document(
     prefix.push_str("</style>\n");
 
     // white background
-    prefix.push_str(&full_rect(0, 0, OV_WIDTH, OV_HEIGHT, palette::BG));
+    prefix.push_str(&full_rect(0, 0, OV_WIDTH, height, palette::BG));
 
-    // header bar — use period_label as subtitle context in the title
+    // header bar
     let header_title = format!("{title} · {period_label}");
     prefix.push_str(&header_bar(&header_title));
 
@@ -276,7 +274,7 @@ pub(super) fn ov_document(
 
     // suffix: footer at bottom
     let mut suffix = String::new();
-    suffix.push_str(&footer_bar(OV_HEIGHT - FOOTER_H));
+    suffix.push_str(&footer_bar(height - FOOTER_H));
     suffix.push_str("</svg>\n");
 
     (prefix, suffix)
@@ -328,11 +326,11 @@ mod tests {
 
     #[test]
     fn ov_document_contains_style_and_background() {
-        let (prefix, suffix) = ov_document("Token Usage", "Last 7 days", 2);
+        let (prefix, suffix) = ov_document("Token Usage", "Last 7 days", 2, 900);
         assert!(prefix.contains("<svg"));
         assert!(prefix.contains("<style>"));
         assert!(prefix.contains(&format!("width=\"{OV_WIDTH}\"")));
-        assert!(prefix.contains(&format!("height=\"{OV_HEIGHT}\"")));
+        assert!(prefix.contains("height=\"900\""));
         assert!(prefix.contains(palette::BG));
         assert!(prefix.contains("cx stats"));
         assert!(suffix.contains("</svg>"));
@@ -340,7 +338,7 @@ mod tests {
 
     #[test]
     fn ov_document_active_tab_highlighted() {
-        let (prefix, _) = ov_document("Token Usage", "Last 7 days", 2);
+        let (prefix, _) = ov_document("Token Usage", "Last 7 days", 2, 900);
         // index 2 = "Last 7 days" should have active pill
         assert!(prefix.contains(palette::ACTIVE_TAB));
         assert!(prefix.contains("tab-active"));
@@ -393,9 +391,9 @@ mod tests {
 
     #[test]
     fn footer_bar_positioned_at_bottom() {
-        let (_prefix, suffix) = ov_document("Test", "All time", 4);
-        // footer should be at OV_HEIGHT - FOOTER_H = 864
-        let footer_y = OV_HEIGHT - FOOTER_H;
+        let (_prefix, suffix) = ov_document("Test", "All time", 4, 900);
+        // footer should be at height - FOOTER_H = 864
+        let footer_y = 900 - FOOTER_H;
         assert!(suffix.contains(&format!("y=\"{footer_y}\"")));
     }
 }

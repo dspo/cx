@@ -98,9 +98,9 @@ impl StatsPeriod {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "today" => Some(Self::Today),
-            "yesterday" | "lastday" | "yda" => Some(Self::Yesterday),
-            "7" | "7d" | "last7" | "last-7" => Some(Self::Last7),
-            "30" | "30d" | "31" | "31d" | "last30" | "last-30" => Some(Self::Last30),
+            "yesterday" | "yda" => Some(Self::Yesterday),
+            "7" | "7d" | "last7" => Some(Self::Last7),
+            "month" | "30" | "30d" | "last30" => Some(Self::Last30),
             "all" => Some(Self::All),
             _ => None,
         }
@@ -570,20 +570,26 @@ fn render_overview(records: &[UsageRecord], today: &str, period: types::Period) 
         .collect();
     let totals = aggregate::totals_by_model(&filtered);
     let cells = aggregate::totals_by_agent_model(&filtered);
-    let top = aggregate::top_models_covering(&totals, 0.90);
+    let top = aggregate::all_models_sorted(&totals);
 
     let period_idx = period_to_tab_index(period);
     let period_label = period.label(today);
-    let (prefix, suffix) = layout::ov_document("CX Stats", &period_label, period_idx);
-    // 动态计算 chart 和 table 的垂直布局：比例分配，chart 不超过内容区 45%
+    // ── 布局计算 ──────────────────────────────────────────
     let row_count = top.len();
     let table_h = table::table_height(row_count);
-    let content_area: f64 = (layout::OV_HEIGHT - layout::OV_MARGIN.top - layout::FOOTER_H) as f64;
-    let chart_max_cap: f64 = content_area * 0.45; // chart 占内容区上限 45%
-    let chart_available: f64 =
-        content_area - table_h - layout::X_AXIS_LABEL_H as f64 - 2.0 * layout::SECTION_GAP as f64; // chart 可用的最大高度
-    let chart_h: f64 = chart_available.min(chart_max_cap).max(200.0); // 最少 200px
-    let chart_bottom: u32 = (layout::OV_MARGIN.top as f64 + chart_h) as u32;
+    // chart 固定高度 350px（足够展示面积图数据）
+    let chart_h: u32 = 350;
+    let chart_bottom: u32 = layout::OV_MARGIN.top + chart_h;
+    // 总高度 = header(top) + chart + x_axis + gap + table + gap + footer
+    let total_height: u32 = layout::OV_MARGIN.top
+        + chart_h
+        + layout::X_AXIS_LABEL_H
+        + layout::SECTION_GAP
+        + table_h as u32
+        + layout::SECTION_GAP
+        + layout::FOOTER_H;
+    let (prefix, suffix) = layout::ov_document("CX Stats", &period_label, period_idx, total_height);
+
     let bounds = chart::PlotBounds {
         left: layout::OV_MARGIN.left,
         right: layout::OV_WIDTH - layout::OV_MARGIN.right,
@@ -592,7 +598,6 @@ fn render_overview(records: &[UsageRecord], today: &str, period: types::Period) 
     };
     let chart_svg = chart::area_chart(&filtered, &top, today, period, &bounds);
 
-    // table 从 chart 下方 + x_axis_labels + gap 开始
     let tbl_x = layout::OV_MARGIN.left as f64;
     let tbl_y = chart_bottom as f64 + layout::X_AXIS_LABEL_H as f64 + layout::SECTION_GAP as f64;
     let tbl_w = (layout::OV_WIDTH - layout::OV_MARGIN.left - layout::OV_MARGIN.right) as f64;
