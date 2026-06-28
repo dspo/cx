@@ -483,6 +483,9 @@ fn default_wire_apis_for_agent(agent_id: &str) -> Vec<WireApi> {
         "copilot" => vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
         "claude" => vec![WireApi::Anthropic],
         "codex" | "Codex.app" => vec![WireApi::Responses],
+        // cox 是 codex 的分叉，额外支持 anthropic / completions。
+        // 仅 `cx cox` 显式调用时进入；不写入默认 agents 列表（见 resolved_agents 追加逻辑）。
+        "cox" => vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
         _ => Vec::new(),
     }
 }
@@ -629,12 +632,32 @@ struct ResolvedAgent {
     args: Vec<String>,
     supported_wire_apis: Vec<WireApi>,
     env: BTreeMap<String, String>,
+    /// 内置隐藏 agent（如 cox）：不显示在默认 agents 列表，
+    /// 仅当用户显式 `cx <id>` 时才进入。由 resolved_agents 追加，不写入用户配置。
+    hidden: bool,
 }
 
 impl ResolvedAgent {
     fn supports_wire_api(&self, wire_api: WireApi) -> bool {
         self.supported_wire_apis.contains(&wire_api)
     }
+}
+
+/// 内置隐藏 agent 注册表：这些 agent 不写入用户配置 YAML，由 `resolved_agents`
+/// 无条件追加（若用户未自定义同名条目）。它们不出现在默认 agents 列表，
+/// 仅当用户显式 `cx <id>` 调用时才命中并进入对应启动流程。
+fn builtin_hidden_agent_configs() -> Vec<AgentConfig> {
+    vec![AgentConfig {
+        id: "cox".into(),
+        binary: "cox".into(),
+        args: Vec::new(),
+        wire_apis: vec![
+            "anthropic".into(),
+            "responses".into(),
+            "completions".into(),
+        ],
+        env: BTreeMap::new(),
+    }]
 }
 
 fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
@@ -657,6 +680,7 @@ fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
                 args: vec![],
                 supported_wire_apis: supported_wire_apis.clone(),
                 env: agent.env.clone(),
+                hidden: false,
             });
             agents.push(ResolvedAgent {
                 id: "Codex.app".into(),
@@ -664,6 +688,7 @@ fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
                 args: vec!["app".into()],
                 supported_wire_apis,
                 env: agent.env.clone(),
+                hidden: false,
             });
         } else {
             agents.push(ResolvedAgent {
@@ -672,9 +697,28 @@ fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
                 args: agent.args.clone(),
                 supported_wire_apis,
                 env: agent.env.clone(),
+                hidden: false,
             });
         }
     }
+
+    // 追加内置隐藏 agent（不写入用户配置 YAML）。若用户已自定义同名条目则跳过，
+    // 以尊重用户的显式配置（此时该 agent 不再隐藏）。
+    for builtin in builtin_hidden_agent_configs() {
+        let id = canonical_agent_id(&builtin.id).to_string();
+        if agents.iter().any(|existing: &ResolvedAgent| existing.id == id) {
+            continue;
+        }
+        agents.push(ResolvedAgent {
+            id: id.clone(),
+            binary: builtin.binary.clone(),
+            args: builtin.args.clone(),
+            supported_wire_apis: default_wire_apis_for_agent(&id),
+            env: builtin.env.clone(),
+            hidden: true,
+        });
+    }
+
     agents
 }
 
@@ -707,13 +751,16 @@ fn default_agent_configs() -> Vec<AgentConfig> {
 fn available_agents_for_add(config: &CxConfig) -> Vec<ResolvedAgent> {
     let agents = resolved_agents(config);
     if !agents.is_empty() {
-        return agents;
+        return agents.into_iter().filter(|a| !a.hidden).collect();
     }
 
     resolved_agents(&CxConfig {
         providers: Vec::new(),
         agents: default_agent_configs(),
     })
+    .into_iter()
+    .filter(|a| !a.hidden)
+    .collect()
 }
 
 fn compatible_agents_for_wire_api(config: &CxConfig, wire_api: WireApi) -> Vec<String> {
@@ -1055,6 +1102,21 @@ fn extract_reasoning_effort(existing: Option<&str>) -> Option<String> {
     None
 }
 
+/// 把 `WireApi` 映射成 codex 家族 config.toml 的 `wire_api` 词汇。
+/// codex / cox 读取的规范值为 `responses` / `chat_completions` / `anthropic_messages`，
+/// 与 cx 内部 `WireApi::launch_value()`（供 copilot 的 `COPILOT_PROVIDER_WIRE_API` 使用，
+/// 值为 `responses` / `completions` / `anthropic`）不同，故单独提供。
+fn codex_wire_api_str(wire_api: WireApi) -> Result<&'static str> {
+    match wire_api {
+        WireApi::Responses => Ok("responses"),
+        WireApi::Completions => Ok("chat_completions"),
+        WireApi::Anthropic => Ok("anthropic_messages"),
+        WireApi::Unavailable => {
+            bail!("该模型当前被标记为 unavailable，请先运行 `cx probe` 更新探测结果")
+        }
+    }
+}
+
 fn merge_codex_config(
     existing: Option<&str>,
     model: &ResolvedModel,
@@ -1102,7 +1164,7 @@ fn merge_codex_config(
         }
     }
 
-    let wire_api_str = wire_api.launch_value()?;
+    let wire_api_str = codex_wire_api_str(wire_api)?;
     let mut rendered = format!(
         "model = {}\nmodel_provider = {}\nmodel_reasoning_effort = {}\n\n[model_providers.{}]\nname = {}\nbase_url = {}\nenv_key = {}\nwire_api = {}\n\n{}{}\ntrust_level = \"trusted\"\n",
         toml_basic_string(&model.id),
@@ -2299,7 +2361,7 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
                 }
                 args.extend(passthrough_args.iter().cloned());
             }
-            "codex" => {
+            "codex" | "cox" => {
                 if let Some(value) = provider
                     .apikey_source
                     .as_ref()
@@ -2373,7 +2435,7 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
                 args.push(model.id.clone());
                 args.extend(passthrough_args.iter().cloned());
             }
-            "codex" => {
+            "codex" | "cox" => {
                 prepare_codex_launch_home(
                     model,
                     provider,
@@ -3631,7 +3693,8 @@ struct AppState {
 impl AppState {
     fn new(agent_hint: Option<String>, config: &CxConfig) -> Self {
         let first_agent = resolved_agents(config)
-            .first()
+            .iter()
+            .find(|a| !a.hidden)
             .map(|a| a.id.clone())
             .unwrap_or("copilot".to_string());
         let selected_agent_id = agent_hint.as_ref().cloned().unwrap_or(first_agent);
@@ -3657,6 +3720,14 @@ impl AppState {
         resolved_agents(&self.config)
     }
 
+    /// 用户可见的 agent 列表（过滤掉内置隐藏 agent 如 cox）。
+    fn visible_agents(&self) -> Vec<ResolvedAgent> {
+        self.resolved_agents()
+            .into_iter()
+            .filter(|a| !a.hidden)
+            .collect()
+    }
+
     fn agent_wire_apis(&self) -> Vec<WireApi> {
         self.resolved_agents()
             .into_iter()
@@ -3676,7 +3747,7 @@ impl AppState {
     fn current_items(&self, models: &[ResolvedModel]) -> Vec<String> {
         match self.step {
             Step::Agent => self
-                .resolved_agents()
+                .visible_agents()
                 .iter()
                 .map(|a| {
                     let mut title = a.id.clone();
@@ -3777,7 +3848,7 @@ impl AppState {
     fn confirm(&mut self, models: &[ResolvedModel]) -> Option<Selection> {
         match self.step {
             Step::Agent => {
-                let agents = self.resolved_agents();
+                let agents = self.visible_agents();
                 if self.agent_index >= agents.len() {
                     return None;
                 }
@@ -5229,6 +5300,98 @@ trust_level = "trusted"
         assert!(!merged.contains("https://old.example.com"));
         // 旧的 dashscope section 应被剥离，由动态 provider key 重新生成
         assert!(merged.contains(r#"model_provider = "dashscope""#));
+    }
+
+    #[test]
+    fn codex_wire_api_str_maps_to_codex_family_vocabulary() {
+        // codex / cox 的 config.toml 使用 responses / chat_completions / anthropic_messages，
+        // 而非 cx 内部 copilot 用的 completions / anthropic。
+        assert_eq!(codex_wire_api_str(WireApi::Responses).unwrap(), "responses");
+        assert_eq!(
+            codex_wire_api_str(WireApi::Completions).unwrap(),
+            "chat_completions"
+        );
+        assert_eq!(
+            codex_wire_api_str(WireApi::Anthropic).unwrap(),
+            "anthropic_messages"
+        );
+        assert!(codex_wire_api_str(WireApi::Unavailable).is_err());
+    }
+
+    #[test]
+    fn merge_codex_config_writes_codex_family_wire_api_for_cox() {
+        // cox 支持 3 种 wire api；config.toml 必须写出 codex 家族词汇。
+        let merged = merge_codex_config(
+            None,
+            &test_resolved_model("claude-sonnet", "https://api.anthropic.com", WireApi::Anthropic),
+            Path::new("/tmp/workspace"),
+            WireApi::Anthropic,
+            "anthropic",
+            "Anthropic",
+            "ANTHROPIC_API_KEY",
+        )
+        .unwrap();
+        assert!(merged.contains(r#"wire_api = "anthropic_messages""#));
+
+        let merged = merge_codex_config(
+            None,
+            &test_resolved_model("gpt-4o", "https://api.openai.com/v1", WireApi::Completions),
+            Path::new("/tmp/workspace"),
+            WireApi::Completions,
+            "openai",
+            "OpenAI",
+            "OPENAI_API_KEY",
+        )
+        .unwrap();
+        assert!(merged.contains(r#"wire_api = "chat_completions""#));
+    }
+
+    #[test]
+    fn cox_is_builtin_hidden_and_resolvable() {
+        // 不在默认 agent 配置里（不写入用户 YAML）。
+        assert!(default_agent_configs().iter().all(|a| a.id != "cox"));
+
+        let config = CxConfig {
+            providers: vec![],
+            agents: default_agent_configs(),
+        };
+        let agents = resolved_agents(&config);
+
+        // cox 由 resolved_agents 追加，且标记为 hidden。
+        let cox = agents.iter().find(|a| a.id == "cox");
+        assert!(cox.is_some(), "cox 应由 resolved_agents 内置追加");
+        assert!(cox.unwrap().hidden, "cox 应标记为 hidden");
+        assert_eq!(
+            cox.unwrap().supported_wire_apis,
+            vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions]
+        );
+        assert_eq!(cox.unwrap().binary, "cox");
+
+        // 用户可见列表与 add 向导均过滤掉 cox。
+        assert!(available_agents_for_add(&config)
+            .iter()
+            .all(|a| a.id != "cox"));
+
+        // find_agent 仍能命中 cox（显式 `cx cox` 可进入）。
+        assert!(find_agent(&config, "cox").is_some());
+    }
+
+    #[test]
+    fn cox_can_see_models_via_supports_agent() {
+        // 回归：visible_agents 字段同时供 supports_agent 做模型过滤，
+        // 不能因「隐藏」而把 cox 从中剔除，否则 `cx cox` 进任何 provider 都看不到模型。
+        let config = multi_wire_api_test_config();
+        let models = build_all_models(&config);
+        assert!(!models.is_empty(), "测试配置应产出模型");
+        // cox 支持 anthropic / responses / completions，该 provider 下所有模型都应可见。
+        for model in &models {
+            assert!(
+                model.supports_agent("cox"),
+                "cox 应能看到模型 {} (wire_api={:?})",
+                model.id,
+                model.wire_api
+            );
+        }
     }
 
     #[test]
