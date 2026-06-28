@@ -1117,6 +1117,7 @@ fn codex_wire_api_str(wire_api: WireApi) -> Result<&'static str> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn merge_codex_config(
     existing: Option<&str>,
     model: &ResolvedModel,
@@ -1125,6 +1126,11 @@ fn merge_codex_config(
     provider_key: &str,
     provider_name: &str,
     env_key: &str,
+    // 发给 provider 的 model id（已剥除 cx 内部 `[Nm]` 上下文后缀）。
+    api_model_id: &str,
+    // 模型上下文窗口 token 数（来自 `[Nm]` 后缀），写入 codex config.toml 的
+    // `model_context_window`。None 则不写、保留用户既有值。
+    context_window: Option<i64>,
 ) -> Result<String> {
     let project_section = format!(
         "[projects.{}]",
@@ -1155,7 +1161,10 @@ fn merge_codex_config(
             if !trimmed.starts_with('[')
                 && (trimmed.starts_with("model =")
                     || trimmed.starts_with("model_provider =")
-                    || trimmed.starts_with("model_reasoning_effort ="))
+                    || trimmed.starts_with("model_reasoning_effort =")
+                    // cx 本次要重写 model_context_window 时，剥离用户旧值以免冲突。
+                    || (context_window.is_some()
+                        && trimmed.starts_with("model_context_window =")))
             {
                 continue;
             }
@@ -1165,11 +1174,15 @@ fn merge_codex_config(
     }
 
     let wire_api_str = codex_wire_api_str(wire_api)?;
+    let context_window_line = context_window
+        .map(|n| format!("model_context_window = {n}\n"))
+        .unwrap_or_default();
     let mut rendered = format!(
-        "model = {}\nmodel_provider = {}\nmodel_reasoning_effort = {}\n\n[model_providers.{}]\nname = {}\nbase_url = {}\nenv_key = {}\nwire_api = {}\n\n{}{}\ntrust_level = \"trusted\"\n",
-        toml_basic_string(&model.id),
+        "model = {}\nmodel_provider = {}\nmodel_reasoning_effort = {}\n{}[model_providers.{}]\nname = {}\nbase_url = {}\nenv_key = {}\nwire_api = {}\n\n{}{}\ntrust_level = \"trusted\"\n",
+        toml_basic_string(api_model_id),
         toml_basic_string(provider_key),
         toml_basic_string(&reasoning_effort),
+        context_window_line,
         toml_basic_string(provider_key),
         toml_basic_string(provider_name),
         toml_basic_string(&model.endpoint_url),
@@ -1187,6 +1200,26 @@ fn merge_codex_config(
     }
 
     Ok(rendered)
+}
+
+/// 解析 model id 末尾的 `[Nm]` 上下文窗口后缀（cx 约定，如 `glm-5.2[1m]`）。
+/// 返回 (发给 provider/agent 的 base id, Option<上下文 token 数>)。
+/// `[1m]` → 1_000_000；`[3m]` → 3_000_000；无后缀则 base = 原 id、hint = None。
+/// `model[1mm]` 这类不匹配的尾缀原样保留。
+fn parse_model_context_suffix(model_id: &str) -> (&str, Option<i64>) {
+    use regex::Regex;
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"\[(\d+)m\]$").unwrap());
+    match re.captures(model_id) {
+        Some(caps) => {
+            let full = caps.get(0).unwrap();
+            let base = &model_id[..full.start()];
+            let n: i64 = caps.get(1).unwrap().as_str().parse().unwrap_or(0);
+            let hint = if n > 0 { Some(n * 1_000_000) } else { None };
+            (base, hint)
+        }
+        None => (model_id, None),
+    }
 }
 
 fn prepare_codex_launch_home(
@@ -1207,6 +1240,9 @@ fn prepare_codex_launch_home(
     let provider_key = provider_config_key(&provider.name);
     let env_key = env_key_for_apikey_source(provider.apikey_source.as_deref());
     let existing_config = fs::read_to_string(real_codex_dir.join("config.toml")).ok();
+    // 剥除 `[Nm]` 上下文后缀：provider 接收的是 base id（如 glm-5.2），
+    // 1m 上下文信息写入 codex 的 model_context_window。
+    let (api_model_id, context_window) = parse_model_context_suffix(&model.id);
     let merged_config = merge_codex_config(
         existing_config.as_deref(),
         model,
@@ -1215,6 +1251,8 @@ fn prepare_codex_launch_home(
         &provider_key,
         &provider.name,
         &env_key,
+        api_model_id,
+        context_window,
     )?;
     write_private_file(&fake_codex_dir.join("config.toml"), &merged_config)?;
 
@@ -1258,6 +1296,7 @@ fn prepare_codex_launch_home_for_app(
     let existing_config = fs::read_to_string(real_codex_dir.join("config.toml")).ok();
     let reasoning_effort =
         extract_reasoning_effort(existing_config.as_deref()).unwrap_or_else(|| "high".to_string());
+    let (api_model_id, context_window) = parse_model_context_suffix(&model.id);
     let merged_config = merge_codex_config(
         existing_config.as_deref(),
         model,
@@ -1266,6 +1305,8 @@ fn prepare_codex_launch_home_for_app(
         &provider_key,
         &provider.name,
         &env_key,
+        api_model_id,
+        context_window,
     )?;
     write_private_file(&codex_dir.join("config.toml"), &merged_config)?;
     println!("[cx] 注入配置: {}", codex_dir.join("config.toml").display());
@@ -2384,7 +2425,9 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
 
         // Inject a unified model identifier so agents and their tooling can
         // detect which model cx configured, regardless of the agent type.
-        env.insert("CX_MODEL".into(), model.id.clone());
+        // 用剥除 `[Nm]` 后缀的 base id（如 glm-5.2），provider 不识别 cx 的上下文后缀。
+        let (api_model_id, _ctx_hint) = parse_model_context_suffix(&model.id);
+        env.insert("CX_MODEL".into(), api_model_id.to_string());
 
         let apikey = if let Some(ref source) = provider.apikey_source {
             resolve_apikey_interactive(source)?
@@ -2401,7 +2444,7 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
                     "COPILOT_PROVIDER_BASE_URL".into(),
                     model.endpoint_url.clone(),
                 );
-                env.insert("COPILOT_MODEL".into(), model.id.clone());
+                env.insert("COPILOT_MODEL".into(), api_model_id.to_string());
                 configure_copilot_auth(&mut env, model.copilot_auth, apikey);
                 match model.wire_api {
                     WireApi::Anthropic => {
@@ -2430,9 +2473,9 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
                 env_remove.push("ANTHROPIC_MODEL".into());
                 env.insert("ANTHROPIC_BASE_URL".into(), model.endpoint_url.clone());
                 env.insert("ANTHROPIC_API_KEY".into(), apikey);
-                env.insert("ANTHROPIC_MODEL".into(), model.id.clone());
+                env.insert("ANTHROPIC_MODEL".into(), api_model_id.to_string());
                 args.push("--model".into());
-                args.push(model.id.clone());
+                args.push(api_model_id.to_string());
                 args.extend(passthrough_args.iter().cloned());
             }
             "codex" | "cox" => {
@@ -4470,6 +4513,47 @@ mod tests {
     }
 
     #[test]
+    fn launch_strips_1m_suffix_for_claude() {
+        // `glm-5.2[1m]` → claude 收到 ANTHROPIC_MODEL=glm-5.2、--model glm-5.2、
+        // CX_MODEL=glm-5.2（[1m] 是 cx 内部上下文后缀，provider 不识别）。
+        let fake_binary = create_fake_binary("claude");
+        let selection = Selection {
+            agent_id: "claude".into(),
+            agent_binary: fake_binary.display().to_string(),
+            agent_args: Vec::new(),
+            agent_env: BTreeMap::new(),
+            selected_wire_api: WireApi::Anthropic,
+            provider: ResolvedProvider {
+                name: "DashScope".into(),
+                has_endpoints: true,
+                apikey_source: Some("literal:test-key".into()),
+                env: BTreeMap::new(),
+            },
+            model: Some(ResolvedModel {
+                id: "glm-5.2[1m]".into(),
+                swe_pro: "—".into(),
+                hle: "—".into(),
+                desc: String::new(),
+                context: "—".into(),
+                wire_api: WireApi::Anthropic,
+                model_wire_apis: vec![WireApi::Anthropic],
+                provider_name: "DashScope".into(),
+                endpoint_url: "https://dashscope.aliyuncs.com/apps/anthropic".into(),
+                visible_agents: vec!["claude".into()],
+                copilot_auth: CopilotAuth::ApiKey,
+                env: BTreeMap::new(),
+            }),
+            injected_models: Vec::new(),
+        };
+        let spec = build_launch_spec(&selection, &[]).unwrap();
+        assert_eq!(spec.env.get("CX_MODEL"), Some(&"glm-5.2".to_string()));
+        assert_eq!(spec.env.get("ANTHROPIC_MODEL"), Some(&"glm-5.2".to_string()));
+        assert!(spec.args.iter().any(|a| a == "glm-5.2"));
+        assert!(!spec.args.iter().any(|a| a.contains("[1m]")));
+        let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
+    }
+
+    #[test]
     fn copilot_with_bearer_auth_sets_bearer_token_env() {
         let fake_binary = create_fake_binary("copilot");
         let selection = Selection {
@@ -5286,6 +5370,8 @@ trust_level = "trusted"
             "dashscope",
             "DashScope",
             "DASHSCOPE_API_KEY",
+            "qwen3.6-plus",
+            None,
         )
         .unwrap();
 
@@ -5329,6 +5415,8 @@ trust_level = "trusted"
             "anthropic",
             "Anthropic",
             "ANTHROPIC_API_KEY",
+            "claude-sonnet",
+            None,
         )
         .unwrap();
         assert!(merged.contains(r#"wire_api = "anthropic_messages""#));
@@ -5341,9 +5429,88 @@ trust_level = "trusted"
             "openai",
             "OpenAI",
             "OPENAI_API_KEY",
+            "gpt-4o",
+            None,
         )
         .unwrap();
         assert!(merged.contains(r#"wire_api = "chat_completions""#));
+    }
+
+    #[test]
+    fn merge_codex_config_strips_1m_suffix_and_writes_context_window() {
+        // glm-5.2[1m] → 发给 codex 的 model 是 glm-5.2；1m 上下文写入 model_context_window。
+        let merged = merge_codex_config(
+            None,
+            &test_resolved_model("glm-5.2[1m]", "https://dashscope/v1", WireApi::Responses),
+            Path::new("/tmp/workspace"),
+            WireApi::Responses,
+            "bailian",
+            "Bailian",
+            "DASHSCOPE_API_KEY",
+            "glm-5.2",
+            Some(1_000_000),
+        )
+        .unwrap();
+        assert!(merged.contains(r#"model = "glm-5.2""#));
+        assert!(!merged.contains("glm-5.2[1m]"));
+        assert!(merged.contains("model_context_window = 1000000"));
+    }
+
+    #[test]
+    fn merge_codex_config_no_suffix_leaves_context_window_absent() {
+        // 无 [Nm] 后缀时不写 model_context_window，也不误删用户既有值。
+        let existing = "model_context_window = 200000\napproval_policy = \"never\"\n";
+        let merged = merge_codex_config(
+            Some(existing),
+            &test_resolved_model("glm-5.1", "https://dashscope/v1", WireApi::Responses),
+            Path::new("/tmp/workspace"),
+            WireApi::Responses,
+            "bailian",
+            "Bailian",
+            "DASHSCOPE_API_KEY",
+            "glm-5.1",
+            None,
+        )
+        .unwrap();
+        assert!(merged.contains(r#"model = "glm-5.1""#));
+        // 用户既有的 context window 被保留（cx 未覆盖）。
+        assert!(merged.contains("model_context_window = 200000"));
+    }
+
+    #[test]
+    fn merge_codex_config_suffix_overrides_user_context_window() {
+        // 有 [Nm] 后缀时 cx 重写 model_context_window，剥离用户旧值。
+        let existing = "model_context_window = 200000\n";
+        let merged = merge_codex_config(
+            Some(existing),
+            &test_resolved_model("glm-5.2[1m]", "https://dashscope/v1", WireApi::Responses),
+            Path::new("/tmp/workspace"),
+            WireApi::Responses,
+            "bailian",
+            "Bailian",
+            "DASHSCOPE_API_KEY",
+            "glm-5.2",
+            Some(1_000_000),
+        )
+        .unwrap();
+        assert!(merged.contains("model_context_window = 1000000"));
+        assert!(!merged.contains("model_context_window = 200000"));
+        // 只出现一次。
+        assert_eq!(
+            merged.matches("model_context_window").count(),
+            1,
+            "model_context_window 不应重复"
+        );
+    }
+
+    #[test]
+    fn parse_model_context_suffix_handles_known_shapes() {
+        assert_eq!(parse_model_context_suffix("glm-5.2[1m]"), ("glm-5.2", Some(1_000_000)));
+        assert_eq!(parse_model_context_suffix("model[3m]"), ("model", Some(3_000_000)));
+        assert_eq!(parse_model_context_suffix("gpt-4o"), ("gpt-4o", None));
+        // 不匹配的尾缀原样保留。
+        assert_eq!(parse_model_context_suffix("model[1mm]"), ("model[1mm]", None));
+        assert_eq!(parse_model_context_suffix("[1m]"), ("", Some(1_000_000)));
     }
 
     #[test]
@@ -5406,6 +5573,8 @@ trust_level = "trusted"
             "custom",
             "Custom",
             "CX_PROVIDER_KEY",
+            "qwen3.6-plus",
+            None,
         )
         .unwrap();
         assert!(merged.contains(r#"model_reasoning_effort = "low""#));
@@ -5428,6 +5597,8 @@ trust_level = "trusted"
             "custom",
             "Custom",
             "CX_PROVIDER_KEY",
+            "qwen3.6-plus",
+            None,
         )
         .unwrap();
         assert!(merged.contains(r#"model_reasoning_effort = "high""#));
