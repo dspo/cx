@@ -5,8 +5,8 @@
 
 use super::aggregate;
 use super::format::{format_share, format_tokens};
-use super::layout::{RACE_HEIGHT, RACE_WIDTH, ov_line, ov_text, race_document};
-use super::palette::{BORDER, FOOTER_BG, SVG_COLORS};
+use super::layout::{RACE_HEIGHT, RACE_WIDTH, ov_text, race_document};
+use super::palette::SVG_COLORS;
 use super::types::{Period, UsageRecord};
 
 // ── Layout constants ────────────────────────────────────────
@@ -28,9 +28,6 @@ pub(super) const TOP_OFFSET: u32 = 60;
 
 /// 最大显示条目数。
 pub(super) const MAX_VISIBLE: usize = 15;
-
-/// Footer 高度。
-pub(super) const FOOTER_H: u32 = 36;
 
 /// Value 标签放在 bar 内部的最小 bar 宽度阈值（px）。
 pub(super) const INSIDE_LABEL_MIN_W: u32 = 80;
@@ -72,7 +69,7 @@ pub(super) fn race_chart(records: &[UsageRecord], today: &str, period: Period) -
     let period_label = period.label(today);
 
     // ── 文档骨架 ──
-    let (prefix, _) = race_document(
+    let (prefix, suffix) = race_document(
         &format!("Model Tokens · {}", period_label),
         &format!("{} · Top {} models", period_label, visible.len()),
     );
@@ -107,14 +104,6 @@ pub(super) fn race_chart(records: &[UsageRecord], today: &str, period: Period) -
         ));
     }
 
-    // ── 自定义 footer（替代 layout 默认 TUI 键盘提示 footer） ──
-    let summary = format!(
-        "↑{} · Top {} models shown",
-        format_tokens(total_all),
-        visible.len(),
-    );
-    let suffix = race_footer(&summary);
-
     format!("{prefix}{body}{suffix}")
 }
 
@@ -123,10 +112,9 @@ pub(super) fn race_chart(records: &[UsageRecord], today: &str, period: Period) -
 /// 无数据时渲染居中提示。
 pub(super) fn empty_race(today: &str, period: Period) -> String {
     let period_label = period.label(today);
-    let (prefix, _) = race_document(&format!("Model Tokens · {}", period_label), "no data");
+    let (prefix, suffix) = race_document(&format!("Model Tokens · {}", period_label), "no data");
     let msg = "暂无数据";
     let centered = ov_text(RACE_WIDTH / 2, RACE_HEIGHT / 2, msg, "subtitle", "middle");
-    let suffix = race_footer("No data");
     format!("{prefix}{centered}{suffix}")
 }
 
@@ -257,32 +245,6 @@ fn render_bar_row(
         "end",
     ));
 
-    svg
-}
-
-// ── Custom footer ────────────────────────────────────────────
-
-/// Race 视图专用 footer：显示 total token 汇总。
-///
-/// 替代 layout 的默认 footer（默认 footer 显示 TUI 键盘提示，不适合图片输出）。
-fn race_footer(summary: &str) -> String {
-    let y = RACE_HEIGHT - FOOTER_H;
-    let mut svg = String::new();
-    // 背景
-    svg.push_str(&format!(
-        "<rect x=\"0\" y=\"{y}\" width=\"{RACE_WIDTH}\" height=\"{FOOTER_H}\" fill=\"{FOOTER_BG}\"/>\n",
-    ));
-    // 上边框
-    svg.push_str(&ov_line(0, y, RACE_WIDTH, y, BORDER, 1.0));
-    // 汇总文本（左对齐，垂直居中）
-    svg.push_str(&ov_text(
-        16,
-        y + FOOTER_H / 2 + 4,
-        summary,
-        "footer-text",
-        "start",
-    ));
-    svg.push_str("</svg>\n");
     svg
 }
 

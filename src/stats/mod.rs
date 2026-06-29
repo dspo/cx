@@ -15,6 +15,7 @@ mod format;
 #[cfg(feature = "image-output")]
 mod image;
 mod layout;
+mod overview;
 mod palette;
 mod parser;
 mod race;
@@ -36,6 +37,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use overview::build_overview_data;
 use parser::{SourceKind, parse_file, parse_file_from_offset};
 use types::UsageRecord;
 
@@ -87,32 +89,23 @@ impl StatsView {
 /// 统计时间区间。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatsPeriod {
-    Today,
-    Yesterday,
-    Last7,
-    Last30,
-    All,
+    Days(u16),
 }
 
 impl StatsPeriod {
     pub fn parse(s: &str) -> Option<Self> {
-        match s.to_lowercase().as_str() {
-            "today" => Some(Self::Today),
-            "yesterday" | "yda" => Some(Self::Yesterday),
-            "7" | "7d" | "last7" => Some(Self::Last7),
-            "month" | "30" | "30d" | "last30" => Some(Self::Last30),
-            "all" => Some(Self::All),
-            _ => None,
+        let s = s.trim().to_lowercase();
+        let day_count = s.strip_suffix('d')?.parse::<u16>().ok()?;
+        if day_count == 0 {
+            None
+        } else {
+            Some(Self::Days(day_count))
         }
     }
 
     fn to_period(self) -> types::Period {
         match self {
-            Self::Today => types::Period::Today,
-            Self::Yesterday => types::Period::Lastday,
-            Self::Last7 => types::Period::Last7,
-            Self::Last30 => types::Period::Last30,
-            Self::All => types::Period::All,
+            Self::Days(day_count) => types::Period::LastDays(day_count),
         }
     }
 }
@@ -506,13 +499,13 @@ pub fn run_stats(config: StatsOutputConfig) -> Result<()> {
         return dump_records(&records, &today);
     }
 
-    let period = config
-        .period
-        .map(|p| p.to_period())
-        .unwrap_or(types::Period::Last7);
     match config.output_format {
         None => tui::run_tui(records, today),
         Some(format) => {
+            let period = config
+                .period
+                .map(|p| p.to_period())
+                .unwrap_or(types::Period::LastMonthDays);
             let svg = render_to_string(&records, &today, period, config.view)?;
             match format {
                 OutputFormat::Svg => {
@@ -553,41 +546,38 @@ fn render_to_string(
 }
 
 /// Map Period enum to period tab index (0–4) used by layout::ov_document.
-fn period_to_tab_index(period: types::Period) -> usize {
+fn period_to_tab_index(period: types::Period, today: &str) -> Option<usize> {
     match period {
-        types::Period::Today => 0,
-        types::Period::Lastday => 1,
-        types::Period::Last7 => 2,
-        types::Period::Last30 => 3,
-        types::Period::All => 4,
+        types::Period::Today => Some(0),
+        types::Period::Lastday => Some(1),
+        types::Period::LastDays(7) => Some(2),
+        types::Period::LastMonthDays => Some(3),
+        types::Period::LastDays(days) if i64::from(days) == date::previous_month_days(today) => {
+            Some(3)
+        }
+        types::Period::All => Some(4),
+        types::Period::LastDays(_) => None,
     }
 }
 
 fn render_overview(records: &[UsageRecord], today: &str, period: types::Period) -> Result<String> {
-    let filtered: Vec<&UsageRecord> = records
-        .iter()
-        .filter(|r| period.includes(&r.date, today))
-        .collect();
-    let totals = aggregate::totals_by_model(&filtered);
-    let cells = aggregate::totals_by_agent_model(&filtered);
-    let top = aggregate::top_models_covering(&totals, 0.90);
+    let overview = build_overview_data(records, today, period);
 
-    let period_idx = period_to_tab_index(period);
+    let period_idx = period_to_tab_index(period, today);
     let period_label = period.label(today);
     // ── 布局计算 ──────────────────────────────────────────
-    let row_count = top.len();
+    let row_count = overview.table.rows.len();
     let table_h = table::table_height(row_count);
     // chart 固定高度 350px（足够展示面积图数据）
     let chart_h: u32 = 350;
     let chart_bottom: u32 = layout::OV_MARGIN.top + chart_h;
-    // 总高度 = header(top) + chart + x_axis + gap + table + gap + footer
+    // 总高度 = top margin + chart + x_axis + gap + table + bottom margin
     let total_height: u32 = layout::OV_MARGIN.top
         + chart_h
         + layout::X_AXIS_LABEL_H
         + layout::SECTION_GAP
         + table_h as u32
-        + layout::SECTION_GAP
-        + layout::FOOTER_H;
+        + layout::OV_MARGIN.bottom;
     let (prefix, suffix) = layout::ov_document("CX Stats", &period_label, period_idx, total_height);
 
     let bounds = chart::PlotBounds {
@@ -596,12 +586,12 @@ fn render_overview(records: &[UsageRecord], today: &str, period: types::Period) 
         top: layout::OV_MARGIN.top,
         bottom: chart_bottom,
     };
-    let chart_svg = chart::area_chart(&filtered, &top, today, period, &bounds);
+    let chart_svg = chart::area_chart(&overview.chart, &bounds);
 
     let tbl_x = layout::OV_MARGIN.left as f64;
     let tbl_y = chart_bottom as f64 + layout::X_AXIS_LABEL_H as f64 + layout::SECTION_GAP as f64;
     let tbl_w = (layout::OV_WIDTH - layout::OV_MARGIN.left - 24) as f64;
-    let table_svg = table::model_table(&top, &totals, &cells, MATRIX_AGENTS, (tbl_x, tbl_y, tbl_w));
+    let table_svg = table::model_table(&overview.table, (tbl_x, tbl_y, tbl_w));
 
     Ok(format!("{prefix}{chart_svg}{table_svg}{suffix}"))
 }
@@ -763,5 +753,18 @@ mod tests {
         assert_eq!(normalize_model_name("model"), "model");
         // 空串不应崩溃
         assert_eq!(normalize_model_name(""), "");
+    }
+
+    #[test]
+    fn stats_period_parse_accepts_positive_day_counts_only() {
+        assert_eq!(StatsPeriod::parse("7d"), Some(StatsPeriod::Days(7)));
+        assert_eq!(StatsPeriod::parse("10d"), Some(StatsPeriod::Days(10)));
+        assert_eq!(StatsPeriod::parse("31D"), Some(StatsPeriod::Days(31)));
+
+        assert_eq!(StatsPeriod::parse("0d"), None);
+        assert_eq!(StatsPeriod::parse("month"), None);
+        assert_eq!(StatsPeriod::parse("7days"), None);
+        assert_eq!(StatsPeriod::parse("today"), None);
+        assert_eq!(StatsPeriod::parse("all"), None);
     }
 }

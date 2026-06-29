@@ -15,6 +15,7 @@ pub(super) const SVG_COLORS: &[&str] = &[
 
 pub(super) const BG: &str = "#ffffff";
 pub(super) const HEADER_BG: &str = "#e6e9ef";
+#[allow(dead_code)]
 pub(super) const PERIOD_BG: &str = "#eff1f5";
 pub(super) const BORDER: &str = "#ccd0da";
 pub(super) const GRID: &str = "#ccd0da";
@@ -22,10 +23,14 @@ pub(super) const AXIS: &str = "#7c7f93";
 pub(super) const TITLE: &str = "#4c4f69";
 pub(super) const TEXT: &str = "#5c5f77";
 pub(super) const DIM: &str = "#7c7f93";
+#[allow(dead_code)]
 pub(super) const ACTIVE_TAB: &str = "#179299";
+#[allow(dead_code)]
 pub(super) const ACTIVE_TAB_TEXT: &str = "#ffffff";
+#[allow(dead_code)]
 pub(super) const INACTIVE_TAB: &str = "#7c7f93";
 pub(super) const STRIPED: &str = "#eff1f5";
+#[allow(dead_code)]
 pub(super) const FOOTER_BG: &str = "#e6e9ef";
 
 // ── 字体栈 ────────────────────────────────────────────────────

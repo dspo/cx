@@ -1496,9 +1496,9 @@ enum DispatchCommand {
         refresh: bool,
     },
     Stats {
-        output_format: Option<stats::OutputFormat>,
-        view: Option<stats::StatsView>,
-        period: Option<stats::StatsPeriod>,
+        output: Option<String>,
+        view: Option<String>,
+        period: Option<String>,
     },
     Launch {
         args: Vec<String>,
@@ -1531,9 +1531,9 @@ fn dispatch_command(raw_args: &[String]) -> DispatchCommand {
                 view,
                 period,
             }) => DispatchCommand::Stats {
-                output_format: output.and_then(|s| stats::OutputFormat::parse(&s)),
-                view: view.and_then(|s| stats::StatsView::parse(&s)),
-                period: period.and_then(|s| stats::StatsPeriod::parse(&s)),
+                output,
+                view,
+                period,
             },
             None => DispatchCommand::Launch { args: Vec::new() },
         },
@@ -1571,10 +1571,33 @@ pub fn run() -> Result<()> {
             run_probe(provider, auto_probe, &config)
         }
         DispatchCommand::Stats {
-            output_format,
+            output,
             view,
             period,
         } => {
+            let output_format = output
+                .map(|value| {
+                    stats::OutputFormat::parse(&value).ok_or_else(|| {
+                        anyhow!("invalid --output `{value}`; expected one of: svg, png, jpg")
+                    })
+                })
+                .transpose()?;
+            let view = view
+                .map(|value| {
+                    stats::StatsView::parse(&value).ok_or_else(|| {
+                        anyhow!("invalid --view `{value}`; expected one of: overview, race")
+                    })
+                })
+                .transpose()?;
+            let period = period
+                .map(|value| {
+                    stats::StatsPeriod::parse(&value).ok_or_else(|| {
+                        anyhow!(
+                            "invalid --period `{value}`; expected format [n]d, for example: 7d, 10d"
+                        )
+                    })
+                })
+                .transpose()?;
             let config = stats::StatsOutputConfig {
                 output_format,
                 view,
@@ -4242,6 +4265,26 @@ mod tests {
                 provider: Some("百炼".into()),
                 auto_probe: false,
             })
+        );
+    }
+
+    #[test]
+    fn stats_dispatch_preserves_raw_period_value_for_validation() {
+        assert_eq!(
+            dispatch(&["stats", "--period", "10d", "--output", "jpg"]),
+            DispatchCommand::Stats {
+                output: Some("jpg".into()),
+                view: None,
+                period: Some("10d".into()),
+            }
+        );
+        assert_eq!(
+            dispatch(&["stats", "--period", "31d"]),
+            DispatchCommand::Stats {
+                output: None,
+                view: None,
+                period: Some("31d".into()),
+            }
         );
     }
 

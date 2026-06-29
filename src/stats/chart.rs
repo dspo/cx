@@ -8,6 +8,7 @@
 //! - 右侧 Legend
 
 use super::format::{format_tokens, short_date};
+use super::overview::OverviewChartData;
 use super::palette;
 
 /// 折线图数据 series：模型名、每日值列表、颜色 hex。
@@ -318,78 +319,19 @@ pub(super) fn render_area_chart(
 /// 3. 计算 max_y
 /// 4. 确定绘图区域边界（使用 layout 常量）
 /// 5. 调用 render_area_chart
-pub(super) fn area_chart(
-    filtered: &[&super::types::UsageRecord],
-    top: &[String],
-    today: &str,
-    _period: super::types::Period,
-    bounds: &PlotBounds,
-) -> String {
-    use super::date;
-
-    // ── 1. 确定日期范围 ────────────────────────────────────
-    let mut dates_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for r in filtered {
-        dates_set.insert(r.date.clone());
-    }
-
-    // 为空白日填充：如果某天没有记录，仍需要日期条目
-    // 取首尾日期，生成完整日期序列
-    let all_dates: Vec<String> =
-        if let (Some(min), Some(max)) = (dates_set.first(), dates_set.last()) {
-            let mut d = min.clone();
-            let mut seq = Vec::new();
-            while d <= *max {
-                seq.push(d.clone());
-                d = date::date_offset(&d, 1).unwrap_or_else(|_| {
-                    // 如果 date_offset 失败就用 max 结束
-                    max.clone()
-                });
-                if d > *max {
-                    break;
-                }
-            }
-            seq
-        } else {
-            // 单日或无数据：用 today
-            vec![today.to_string()]
-        };
-    let _day_count = all_dates.len();
-
-    // ── 2. 构建每日 per-model 聚合 ─────────────────────────
-    // model_name -> date -> total_tokens
-    let mut model_daily: std::collections::HashMap<String, std::collections::HashMap<String, u64>> =
-        std::collections::HashMap::new();
-    for model in top {
-        model_daily.insert(model.clone(), std::collections::HashMap::new());
-    }
-    for r in filtered {
-        if let Some(daily) = model_daily.get_mut(&r.model) {
-            let entry = daily.entry(r.date.clone()).or_insert(0u64);
-            *entry = entry.saturating_add(r.in_tokens + r.out_tokens);
-        }
-    }
-
-    // ── 3. 构建 series 数据 ────────────────────────────────
-    // 空白日补 0
-    let mut series: Vec<ChartSeries> = Vec::new();
-    let mut max_y: f64 = 0.0;
-    for (rank, model) in top.iter().enumerate() {
-        let daily = model_daily.get(model).unwrap();
-        let values: Vec<f64> = all_dates
-            .iter()
-            .map(|d| {
-                let v = *daily.get(d).unwrap_or(&0u64) as f64;
-                max_y = max_y.max(v);
-                v
-            })
-            .collect();
-        let color_idx = rank % palette::SVG_COLORS.len();
-        let color = palette::SVG_COLORS[color_idx].to_string();
-        series.push((model.clone(), values, color));
-    }
-
-    render_area_chart(&series, &all_dates, max_y, &bounds)
+pub(super) fn area_chart(data: &OverviewChartData, bounds: &PlotBounds) -> String {
+    let series: Vec<ChartSeries> = data
+        .series
+        .iter()
+        .map(|series| {
+            (
+                series.model.clone(),
+                series.values.clone(),
+                palette::SVG_COLORS[series.color_index % palette::SVG_COLORS.len()].to_string(),
+            )
+        })
+        .collect();
+    render_area_chart(&series, &data.dates, data.max_y, bounds)
 }
 
 #[cfg(test)]
