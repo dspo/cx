@@ -9,7 +9,7 @@
 
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 
@@ -239,6 +239,7 @@ pub struct SessionHandle {
     reader: Mutex<Box<dyn Read + Send>>,
     writer_tx: mpsc::Sender<WriteReq>,
     resize_flag: Arc<AtomicBool>,
+    accept_shutdown: Arc<AtomicBool>,
     session_id: String,
     socket_path: PathBuf,
     /// Whether the injection socket was actually bound. False when `IpcServer::bind`
@@ -283,9 +284,10 @@ impl SessionHandle {
 
         // IPC is best-effort: the session still works without external injection.
         let mut socket_bound = false;
+        let accept_shutdown = Arc::new(AtomicBool::new(false));
         match IpcServer::bind(&socket_path) {
             Ok(ipc) => {
-                ipc.accept_loop(tx.clone());
+                ipc.accept_loop(tx.clone(), Arc::clone(&accept_shutdown));
                 let reg = SessionRegistry {
                     id: session_id.clone(),
                     socket: socket_path.to_string_lossy().into_owned(),
@@ -312,6 +314,7 @@ impl SessionHandle {
             reader: Mutex::new(reader),
             writer_tx: tx,
             resize_flag,
+            accept_shutdown,
             session_id,
             socket_path,
             socket_bound,
@@ -403,6 +406,11 @@ impl SessionHandle {
             Some(status.to_string())
         };
 
+        // Stop the accept loop (non-blocking, polls this flag) so its thread and
+        // sender clone don't outlive the session. Done before removing the socket
+        // file so the loop exits even if a peer is mid-handshake.
+        self.accept_shutdown.store(true, Ordering::Relaxed);
+
         // Remove the bound socket (may be a custom `--socket` path) and the
         // registry sibling so neither lingers as a stale session.
         let _ = std::fs::remove_file(&self.socket_path);
@@ -432,6 +440,7 @@ impl Drop for SessionHandle {
         // kill + reap so the child is not orphaned, then remove session files.
         // The Warp stop is handled by `WarpSession`'s own Drop (exit_code None).
         if !self.finalized {
+            self.accept_shutdown.store(true, Ordering::Relaxed);
             if let Some(mut child) = self.child.take() {
                 let _ = child.kill();
                 let _ = child.wait();
