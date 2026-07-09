@@ -58,11 +58,19 @@ pub(crate) fn run(spec: &LaunchSpec, warp_session: &Option<WarpSession>) -> ! {
     } = pty;
 
     // IPC is best-effort: the relay still works without external injection.
+    //
+    // The socket path is a `--socket` override when given, else the default
+    // ~/.config/cx/sessions/<id>.sock. The registry advertises whichever is bound,
+    // so `cx send` finds the session regardless of which path was used.
     let (tx, rx) = mpsc::channel::<WriteReq>();
-    match ipc::IpcServer::bind(&session_id) {
-        Ok(ipc) => {
-            ipc.accept_loop(tx.clone());
-            if let Ok(sock) = session::socket_path(&session_id) {
+    let sock_path = match spec.socket.as_deref() {
+        Some(p) => Ok(std::path::PathBuf::from(p)),
+        None => session::socket_path(&session_id),
+    };
+    match sock_path {
+        Ok(sock) => match ipc::IpcServer::bind(&sock) {
+            Ok(ipc) => {
+                ipc.accept_loop(tx.clone());
                 let reg = SessionRegistry {
                     id: session_id.clone(),
                     socket: sock.to_string_lossy().into_owned(),
@@ -82,8 +90,9 @@ pub(crate) fn run(spec: &LaunchSpec, warp_session: &Option<WarpSession>) -> ! {
                 println!("socket: {}", sock.display());
                 let _ = std::io::stdout().flush();
             }
-        }
-        Err(e) => eprintln!("cx: IPC 绑定失败（外部注入不可用）: {e}"),
+            Err(e) => eprintln!("cx: IPC 绑定失败（外部注入不可用）: {e}"),
+        },
+        Err(e) => eprintln!("cx: 解析 socket 路径失败（外部注入不可用）: {e}"),
     }
 
     // Blank separator between the banner and the agent's raw output, flushed so it

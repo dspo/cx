@@ -6,6 +6,7 @@
 // are reclaimed by a connect-probe before bind.
 
 use std::os::unix::net::UnixListener;
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 
@@ -19,20 +20,23 @@ pub(crate) struct IpcServer {
 }
 
 impl IpcServer {
-    /// Bind the session socket, reclaiming it if it belongs to a dead session.
-    pub(crate) fn bind(id: &str) -> Result<Self> {
-        let sock = session::socket_path(id)?;
+    /// Bind the session socket at `sock`, reclaiming it if it belongs to a dead session.
+    ///
+    /// `sock` is fully resolved by the caller (either the default
+    /// `~/.config/cx/sessions/<id>.sock` or a `--socket` override), so this fn is
+    /// agnostic to the path's origin.
+    pub(crate) fn bind(sock: &Path) -> Result<Self> {
         if let Some(parent) = sock.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("创建 sessions 目录失败: {}", parent.display()))?;
         }
         if sock.exists() {
-            if session::socket_alive(&sock) {
+            if session::socket_alive(sock) {
                 anyhow::bail!("session socket 已被活跃会话占用: {}", sock.display());
             }
-            let _ = std::fs::remove_file(&sock);
+            let _ = std::fs::remove_file(sock);
         }
-        let listener = UnixListener::bind(&sock)
+        let listener = UnixListener::bind(sock)
             .with_context(|| format!("bind IPC socket 失败: {}", sock.display()))?;
         Ok(Self { listener })
     }
