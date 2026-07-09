@@ -257,6 +257,26 @@ fn canonical_agent_id(agent_id: &str) -> &str {
     }
 }
 
+/// Normalize a CLI-supplied agent name: case-insensitive, with alias collapsing.
+///
+/// `CoDex.App` / `codexapp` / `codex_app` all resolve to the `Codex.app` agent; the
+/// remaining ids (`claude`, `codex`, `copilot`, `codex+`) are lowercased verbatim. This
+/// only touches user-facing input — internal config/registry ids are already canonical.
+fn canonicalize_agent_name(input: &str) -> String {
+    match input.to_lowercase().as_str() {
+        "codex_app" | "codexapp" | "codex.app" => "Codex.app".into(),
+        other => other.into(),
+    }
+}
+
+fn find_agent(config: &CxConfig, agent_id: &str) -> Option<ResolvedAgent> {
+    let normalized = canonicalize_agent_name(agent_id);
+    let agent_id = canonical_agent_id(&normalized);
+    resolved_agents(config)
+        .into_iter()
+        .find(|agent| agent.id == agent_id)
+}
+
 fn normalize_agent_ids(agent_ids: &[String]) -> Vec<String> {
     let mut normalized = Vec::new();
     for agent_id in agent_ids {
@@ -509,17 +529,6 @@ fn compatible_agents_for_wire_api(config: &CxConfig, wire_api: WireApi) -> Vec<S
         .filter(|agent| agent.supports_wire_api(wire_api))
         .map(|agent| agent.id)
         .collect()
-}
-
-fn find_agent(config: &CxConfig, agent_id: &str) -> Option<ResolvedAgent> {
-    let agent_id = canonical_agent_id(agent_id);
-    resolved_agents(config)
-        .into_iter()
-        .find(|agent| agent.id == agent_id)
-}
-
-fn unsupported_codex_app_message() -> &'static str {
-    "`cx` 不再代理 `codex app` 桌面版。请直接运行原生 `codex app ...`；终端版仍可继续使用 `cx codex ...`。"
 }
 
 fn create_default_provider_config(path: &Path) -> Result<()> {
@@ -1206,9 +1215,19 @@ fn injected_models_for_codex_app(
     about = "统一 Agent 入口",
     version = VERSION,
     disable_help_subcommand = true,
-    disable_version_flag = true
+    disable_version_flag = true,
+    after_help = "\
+用 `--` 分隔 cx 自身参数与被启动 agent 的参数：
+  cx                       进 TUI 选 agent（直连）
+  cx --pty                 进 TUI 选 agent（PTY 中继，支持 `cx send` 注入）
+  cx --pty -- claude --dangerously-skip-permissions   跳过 agent 选择，透传该 flag
+  cx --pty -- --dangerously-skip-permissions          进 TUI 选 agent，选定后透传该 flag
+  cx -- Codex.App          大小写不敏感，等价 `cx -- codex.app`"
 )]
 struct Cli {
+    /// 经 PTY 中继启动（cx 持 master，终端 IO 透传，并暴露外部 IPC 注入入口）；默认直连。
+    #[arg(long)]
+    pty: bool,
     #[command(subcommand)]
     command: Option<CxCommand>,
 }
@@ -1291,54 +1310,93 @@ enum DispatchCommand {
     },
     Launch {
         args: Vec<String>,
+        pty: bool,
     },
 }
 
-fn dispatch_command(raw_args: &[String]) -> DispatchCommand {
-    match Cli::try_parse_from(raw_args) {
+/// Split `raw_args` at the first bare `--` token into cx-side and agent-side args.
+///
+/// `raw_args[0]` (the program name) always stays on the cx side. The `--` token
+/// itself is dropped; everything after it is returned verbatim so leading-`-` agent
+/// flags survive. Returns whether a `--` was present.
+fn split_at_first_dash_dash(raw_args: &[String]) -> (Vec<String>, Vec<String>, bool) {
+    let dash = raw_args
+        .iter()
+        .skip(1)
+        .position(|arg| arg == "--")
+        .map(|i| i + 1);
+    match dash {
+        Some(i) => {
+            let cx_args = raw_args[..i].to_vec();
+            let agent_args = raw_args[i + 1..].to_vec();
+            (cx_args, agent_args, true)
+        }
+        None => (raw_args.to_vec(), Vec::new(), false),
+    }
+}
+
+fn dispatch_command(raw_args: &[String]) -> Result<DispatchCommand> {
+    let (cx_args, agent_args, had_dash) = split_at_first_dash_dash(raw_args);
+    match Cli::try_parse_from(&cx_args) {
         Ok(cli) => match cli.command {
-            Some(CxCommand::Help) => DispatchCommand::Help,
-            Some(CxCommand::Add) => DispatchCommand::Add,
+            Some(CxCommand::Help) => Ok(DispatchCommand::Help),
+            Some(CxCommand::Add) => Ok(DispatchCommand::Add),
             Some(CxCommand::Patch {
                 source,
                 url,
                 refresh,
-            }) => DispatchCommand::Patch {
+            }) => Ok(DispatchCommand::Patch {
                 source,
                 url,
                 refresh,
-            },
+            }),
             Some(CxCommand::Probe {
                 provider,
                 auto_probe,
-            }) => DispatchCommand::Probe {
+            }) => Ok(DispatchCommand::Probe {
                 provider,
                 auto_probe,
-            },
+            }),
             Some(CxCommand::Stats {
                 output,
                 view,
                 period,
-            }) => DispatchCommand::Stats {
+            }) => Ok(DispatchCommand::Stats {
                 output,
                 view,
                 period,
-            },
+            }),
             Some(CxCommand::Send {
                 session,
                 agent,
                 latest,
                 text,
-            }) => DispatchCommand::Send {
+            }) => Ok(DispatchCommand::Send {
                 session,
                 agent,
                 latest,
                 text,
-            },
-            None => DispatchCommand::Launch { args: Vec::new() },
+            }),
+            None => Ok(DispatchCommand::Launch {
+                args: agent_args,
+                pty: cli.pty,
+            }),
         },
-        Err(_) => DispatchCommand::Launch {
-            args: raw_args[1..].to_vec(),
+        Err(e) => match e.kind() {
+            clap::error::ErrorKind::DisplayHelp
+            | clap::error::ErrorKind::DisplayVersion
+            | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => e.exit(),
+            _ => {
+                if had_dash {
+                    // `--` already separated cx flags from agent args, so a parse error
+                    // here is a genuine cx-side flag error (e.g. unknown `--foo`).
+                    bail!("{e}");
+                }
+                bail!(
+                    "cx 不再直接接受 agent 名或未知参数；请用 `cx -- <agent> [args]`，\
+                     或 `cx --pty -- <agent> [args]`（详见 `cx --help`）"
+                );
+            }
         },
     }
 }
@@ -1349,7 +1407,7 @@ fn dispatch_command(raw_args: &[String]) -> DispatchCommand {
 
 pub fn run() -> Result<()> {
     let raw_args: Vec<String> = env::args().collect();
-    match dispatch_command(&raw_args) {
+    match dispatch_command(&raw_args)? {
         DispatchCommand::Help => {
             print_help();
             Ok(())
@@ -1411,22 +1469,18 @@ pub fn run() -> Result<()> {
             latest,
             text,
         } => run_send(session, agent, latest, text),
-        DispatchCommand::Launch { args } => {
-            // No subcommand or an unknown one → treat as Launch with optional agent hint.
+        DispatchCommand::Launch { args, pty } => {
+            // `--` separated cx flags from agent args; the first arg, if it names a
+            // known agent, is consumed as the hint and dropped from passthrough.
             let config = load_config()?;
 
             if let Some(first) = args.first() {
-                if first == "codex-app"
-                    || (first == "codex" && args.get(1).map(String::as_str) == Some("app"))
-                {
-                    bail!(unsupported_codex_app_message());
-                }
                 if let Some(agent) = find_agent(&config, first) {
-                    return run_launcher(Some(agent.id), &config, args[1..].to_vec());
+                    return run_launcher(Some(agent.id), &config, args[1..].to_vec(), pty);
                 }
             }
 
-            run_launcher(None, &config, args)
+            run_launcher(None, &config, args, pty)
         }
     }
 }
@@ -1439,6 +1493,7 @@ fn run_launcher(
     agent_hint: Option<String>,
     config: &CxConfig,
     passthrough_args: Vec<String>,
+    pty: bool,
 ) -> Result<()> {
     let rerun_agent_hint = agent_hint.clone();
     let mut all_models = build_all_models(config);
@@ -1453,18 +1508,22 @@ fn run_launcher(
     if selection.provider.name == ADD_PROVIDER_SENTINEL {
         if run_add()? {
             let refreshed = load_config()?;
-            return run_launcher(rerun_agent_hint, &refreshed, passthrough_args);
+            return run_launcher(rerun_agent_hint, &refreshed, passthrough_args, pty);
         }
         return Ok(());
     }
 
     // Codex.app 走专门的启动 + renderer 注入路径，不经通用 build_launch_spec/launch_agent。
+    // 它是 GUI detach，不接管终端，--pty 对它无意义。
     if selection.agent_id == "Codex.app" {
+        if pty {
+            eprintln!("cx: --pty 对 Codex.app 无效（GUI detach，不经 PTY 中继）");
+        }
         apply_selected_model_tab_name(&selection)?;
         return codex_app::launch_with_injection(&selection, &passthrough_args);
     }
 
-    let spec = build_launch_spec(&selection, &passthrough_args)?;
+    let spec = build_launch_spec(&selection, &passthrough_args, pty)?;
 
     apply_selected_model_tab_name(&selection)?;
     launch_agent(spec)
@@ -1976,10 +2035,10 @@ fn launch_agent(spec: LaunchSpec) -> Result<()> {
     // Warp 集成：在启动 agent 前发出 session_start 事件
     let warp_session = warp::maybe_emit_session_start(&spec.agent_id, spec.model_id.as_deref());
 
-    // PTY 中继路径：cx 持 master，终端 IO 透传，并暴露 IPC 注入入口。
+    // PTY 中继路径（opt-in，`cx --pty`）：cx 持 master，终端 IO 透传，并暴露 IPC 注入入口。
     // relay::run 自行打印摘要、spawn、进 raw mode、收尾，返回 `!`。
     // Ctrl+C 在 raw mode 下作为 0x03 透传给 slave，由 agent 自处理，cx 不再被
-    // SIGINT 杀掉（直连 status() 路径的老限制）。`CX_PTY=0` 时 spec.pty 为 false，回退直连。
+    // SIGINT 杀掉（直连 status() 路径的老限制）。未传 --pty 时 spec.pty 为 false，走下方直连。
     if spec.pty {
         relay::run(&spec, &warp_session);
     }
@@ -1998,10 +2057,11 @@ fn launch_agent(spec: LaunchSpec) -> Result<()> {
     let started_at = std::time::Instant::now();
     let started_sys = std::time::SystemTime::now();
 
-    // 直连路径（CX_PTY=0）：spawn + wait，子进程继承 stdin/stdout/stderr，cx 作为静默父进程等待。
+    // 直连路径（默认，未传 --pty）：spawn + wait，子进程继承 stdin/stdout/stderr，
+    // cx 作为静默父进程等待。
     //
     // 已知限制：若用户在 agent 运行时按 Ctrl+C，Rust 默认 SIGINT handler 会立即终止 cx
-    // 进程，此时退出摘要和 Warp stop 事件不会触发。PTY 中继路径（默认）已规避此问题。
+    // 进程，此时退出摘要和 Warp stop 事件不会触发。PTY 中继路径（`cx --pty`）规避此问题。
     let status = command
         .status()
         .with_context(|| format!("启动 `{}` 失败", spec.program.display()))?;
@@ -2228,11 +2288,15 @@ struct LaunchSpec {
     /// 选中的模型 ID，供 Warp 集成和退出摘要使用。
     model_id: Option<String>,
     /// 是否经 PTY 中继启动（cx 持 master，终端 IO 透传），而非 `Command::status()` 直连。
-    /// `CX_PTY=0` 可强制关闭以回退到直连路径。
+    /// 由 `--pty` CLI flag 决定；默认 false（直连）。
     pty: bool,
 }
 
-fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Result<LaunchSpec> {
+fn build_launch_spec(
+    selection: &Selection,
+    passthrough_args: &[String],
+    pty: bool,
+) -> Result<LaunchSpec> {
     let program = resolve_binary(&selection.agent_binary)?;
     let mut args = Vec::new();
     args.extend(selection.agent_args.iter().cloned());
@@ -2392,9 +2456,6 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
         None => format!("启动 {} | Provider: {}", agent_id, provider.name),
     };
 
-    // PTY 中继默认对全体非 detach agent 启用；`CX_PTY=0` 回退到直连 status() 路径。
-    let pty = env::var("CX_PTY").ok().as_deref() != Some("0");
-
     Ok(LaunchSpec {
         program,
         args,
@@ -2405,6 +2466,7 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
         agent_id: agent_id.clone(),
         provider_name: provider.name.clone(),
         model_id: selection.model.as_ref().map(|m| m.id.clone()),
+        // PTY 中继 opt-in：仅当传入 --pty 时启用，否则 build_launch_spec 调用方走直连 status()。
         pty,
     })
 }
@@ -4127,7 +4189,7 @@ mod tests {
             .and_then(|cli| cli.command)
     }
 
-    fn dispatch(args: &[&str]) -> DispatchCommand {
+    fn dispatch(args: &[&str]) -> Result<DispatchCommand> {
         let raw_args = std::iter::once("cx".to_string())
             .chain(args.iter().map(|arg| (*arg).to_string()))
             .collect::<Vec<_>>();
@@ -4141,7 +4203,13 @@ mod tests {
 
     #[test]
     fn zero_args_dispatch_to_launcher() {
-        assert_eq!(dispatch(&[]), DispatchCommand::Launch { args: Vec::new() });
+        assert_eq!(
+            dispatch(&[]).unwrap(),
+            DispatchCommand::Launch {
+                args: Vec::new(),
+                pty: false,
+            }
+        );
     }
 
     #[test]
@@ -4169,7 +4237,7 @@ mod tests {
     #[test]
     fn stats_dispatch_preserves_raw_period_value_for_validation() {
         assert_eq!(
-            dispatch(&["stats", "--period", "10d", "--output", "jpg"]),
+            dispatch(&["stats", "--period", "10d", "--output", "jpg"]).unwrap(),
             DispatchCommand::Stats {
                 output: Some("jpg".into()),
                 view: None,
@@ -4177,7 +4245,7 @@ mod tests {
             }
         );
         assert_eq!(
-            dispatch(&["stats", "--period", "31d"]),
+            dispatch(&["stats", "--period", "31d"]).unwrap(),
             DispatchCommand::Stats {
                 output: None,
                 view: None,
@@ -4235,17 +4303,60 @@ mod tests {
 
     #[test]
     fn dispatch_help_stays_help() {
-        assert_eq!(dispatch(&["help"]), DispatchCommand::Help);
+        assert_eq!(dispatch(&["help"]).unwrap(), DispatchCommand::Help);
     }
 
     #[test]
-    fn dispatch_unknown_subcommand_falls_through_to_launcher() {
+    fn dispatch_bare_agent_name_errors() {
+        // `cx claude mcp list` (no `--`) is no longer tolerated — the agent name
+        // must come after `--`.
+        assert!(dispatch(&["claude", "mcp", "list"]).is_err());
+    }
+
+    #[test]
+    fn dispatch_dash_dash_separates_pty_and_agent_args() {
+        // `cx --pty -- claude --foo` → pty on, args = ["claude", "--foo"]
         assert_eq!(
-            dispatch(&["claude", "mcp", "list"]),
+            dispatch(&["--pty", "--", "claude", "--foo"]).unwrap(),
             DispatchCommand::Launch {
-                args: vec!["claude".into(), "mcp".into(), "list".into()]
+                args: vec!["claude".into(), "--foo".into()],
+                pty: true,
             }
         );
+        // `cx --pty -- --foo` → TUI agent selection, passthrough = ["--foo"]
+        assert_eq!(
+            dispatch(&["--pty", "--", "--foo"]).unwrap(),
+            DispatchCommand::Launch {
+                args: vec!["--foo".into()],
+                pty: true,
+            }
+        );
+        // `cx -- claude` → pty off (direct), args = ["claude"]
+        assert_eq!(
+            dispatch(&["--", "claude"]).unwrap(),
+            DispatchCommand::Launch {
+                args: vec!["claude".into()],
+                pty: false,
+            }
+        );
+        // `cx --pty` (no agent args) → pty on, TUI selection
+        assert_eq!(
+            dispatch(&["--pty"]).unwrap(),
+            DispatchCommand::Launch {
+                args: Vec::new(),
+                pty: true,
+            }
+        );
+    }
+
+    #[test]
+    fn canonicalize_agent_name_is_case_insensitive_with_aliases() {
+        assert_eq!(canonicalize_agent_name("CoDex.App"), "Codex.app");
+        assert_eq!(canonicalize_agent_name("codex.app"), "Codex.app");
+        assert_eq!(canonicalize_agent_name("CODEXAPP"), "Codex.app");
+        assert_eq!(canonicalize_agent_name("codex_app"), "Codex.app");
+        assert_eq!(canonicalize_agent_name("Claude"), "claude");
+        assert_eq!(canonicalize_agent_name("CODEX+"), "codex+");
     }
 
     // ── Launch spec tests ──
@@ -4269,7 +4380,7 @@ mod tests {
             injected_models: Vec::new(),
         };
 
-        let spec = build_launch_spec(&selection, &["mcp".into(), "serve".into()]).unwrap();
+        let spec = build_launch_spec(&selection, &["mcp".into(), "serve".into()], false).unwrap();
         assert_eq!(spec.args, vec!["mcp".to_string(), "serve".to_string()]);
         let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
     }
@@ -4292,7 +4403,7 @@ mod tests {
             model: None,
             injected_models: Vec::new(),
         };
-        let spec = build_launch_spec(&selection, &[]).unwrap();
+        let spec = build_launch_spec(&selection, &[], false).unwrap();
         assert!(spec.env_remove.contains(&"ANTHROPIC_API_KEY".to_string()));
         assert!(
             spec.env_remove
@@ -4341,7 +4452,7 @@ mod tests {
             }),
             injected_models: Vec::new(),
         };
-        let spec = build_launch_spec(&selection, &["mcp".into(), "list".into()]).unwrap();
+        let spec = build_launch_spec(&selection, &["mcp".into(), "list".into()], false).unwrap();
         assert!(spec.env_remove.contains(&"ANTHROPIC_API_KEY".to_string()));
         assert!(
             spec.env_remove
@@ -4404,7 +4515,7 @@ mod tests {
             }),
             injected_models: Vec::new(),
         };
-        let spec = build_launch_spec(&selection, &[]).unwrap();
+        let spec = build_launch_spec(&selection, &[], false).unwrap();
         assert_eq!(spec.env.get("CX_MODEL"), Some(&"glm-5.2".to_string()));
         assert_eq!(
             spec.env.get("ANTHROPIC_MODEL"),
@@ -4448,7 +4559,7 @@ mod tests {
             injected_models: Vec::new(),
         };
 
-        let spec = build_launch_spec(&selection, &[]).unwrap();
+        let spec = build_launch_spec(&selection, &[], false).unwrap();
         assert_eq!(
             spec.env.get("COPILOT_PROVIDER_BEARER_TOKEN"),
             Some(&"test-key".to_string())
@@ -4500,7 +4611,7 @@ mod tests {
             injected_models: Vec::new(),
         };
 
-        let spec = build_launch_spec(&selection, &[]).unwrap();
+        let spec = build_launch_spec(&selection, &[], false).unwrap();
         assert_eq!(spec.env.get("COPILOT_MODEL"), Some(&"glm-5.2".to_string()));
         assert_eq!(
             spec.env.get("COPILOT_PROVIDER_MAX_PROMPT_TOKENS"),
@@ -4544,7 +4655,7 @@ mod tests {
             injected_models: Vec::new(),
         };
 
-        let spec = build_launch_spec(&selection, &[]).unwrap();
+        let spec = build_launch_spec(&selection, &[], false).unwrap();
         assert!(spec.env.get("COPILOT_MODEL").is_some());
         assert!(!spec.env.contains_key("COPILOT_PROVIDER_MAX_PROMPT_TOKENS"));
         let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
@@ -4602,7 +4713,7 @@ mod tests {
             model: None,
             injected_models: Vec::new(),
         };
-        let spec = build_launch_spec(&selection, &[]).unwrap();
+        let spec = build_launch_spec(&selection, &[], false).unwrap();
         assert_eq!(spec.env.get("MY_AGENT_VAR"), Some(&"from-agent".into()));
         let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
     }
@@ -4642,7 +4753,7 @@ mod tests {
             }),
             injected_models: Vec::new(),
         };
-        let spec = build_launch_spec(&selection, &[]).unwrap();
+        let spec = build_launch_spec(&selection, &[], false).unwrap();
         assert_eq!(
             spec.env.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
             Some(&"1000000".into())
@@ -4690,7 +4801,7 @@ mod tests {
             }),
             injected_models: Vec::new(),
         };
-        let spec = build_launch_spec(&selection, &[]).unwrap();
+        let spec = build_launch_spec(&selection, &[], false).unwrap();
         // Model env overrides agent env for the shared key
         assert_eq!(spec.env.get("SHARED_VAR"), Some(&"from-model".into()));
         // Both unique keys are present
@@ -4725,7 +4836,7 @@ mod tests {
             model: None,
             injected_models: Vec::new(),
         };
-        let spec = build_launch_spec(&selection, &[]).unwrap();
+        let spec = build_launch_spec(&selection, &[], false).unwrap();
         // Provider overrides agent
         assert_eq!(spec.env.get("SHARED"), Some(&"from-provider".into()));
         assert_eq!(spec.env.get("AGENT_ONLY"), Some(&"agent".into()));
@@ -4775,7 +4886,7 @@ mod tests {
             }),
             injected_models: Vec::new(),
         };
-        let spec = build_launch_spec(&selection, &[]).unwrap();
+        let spec = build_launch_spec(&selection, &[], false).unwrap();
         // Model overrides provider for shared key
         assert_eq!(spec.env.get("SHARED"), Some(&"from-model".into()));
         // Provider-only key is still present (via merged model.env)
