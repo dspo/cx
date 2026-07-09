@@ -24,6 +24,14 @@ pub(super) fn date_field(value: Option<&Value>) -> Option<String> {
     if date.is_empty() { None } else { Some(date) }
 }
 
+/// Parse an ISO 8601 timestamp string into Unix seconds since epoch.
+/// Returns `None` if the string cannot be parsed.
+pub(super) fn timestamp_secs_from_iso(s: &str) -> Option<u64> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp() as u64)
+}
+
 /// Unix seconds → `"YYYY-MM-DD"` (UTC).
 pub(super) fn date_from_unix_secs(secs: i64) -> String {
     unix_to_date(secs)
