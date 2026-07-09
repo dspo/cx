@@ -35,10 +35,11 @@ pub(crate) fn run(spec: &LaunchSpec, warp_session: &Option<WarpSession>) -> ! {
     let started_at = Instant::now();
     let started_sys = SystemTime::now();
 
-    // Summary in cooked mode before raw mode swallows the newlines.
+    // Launch banner in cooked mode before raw mode swallows the newlines. The socket
+    // line is appended once the IPC bind succeeds (below), so only a live socket is
+    // advertised; a trailing blank separates the banner from the agent's raw output.
     println!();
     println!("{}", spec.summary);
-    println!();
     let _ = std::io::stdout().flush();
 
     let pty = match spawn_pty(spec, &warp_env(warp_session)) {
@@ -75,10 +76,20 @@ pub(crate) fn run(spec: &LaunchSpec, warp_session: &Option<WarpSession>) -> ! {
                         .unwrap_or_default(),
                 };
                 let _ = session::write_registry(&reg);
+                // Advertise the injection socket while still in cooked mode, before raw
+                // mode swallows the output. External processes (e.g. `cx send`) connect
+                // here to inject messages as if the user typed them.
+                println!("socket: {}", sock.display());
+                let _ = std::io::stdout().flush();
             }
         }
         Err(e) => eprintln!("cx: IPC 绑定失败（外部注入不可用）: {e}"),
     }
+
+    // Blank separator between the banner and the agent's raw output, flushed so it
+    // lands before raw mode takes over.
+    println!();
+    let _ = std::io::stdout().flush();
 
     // Enter raw mode so keystrokes pass through verbatim (Ctrl+C = 0x03, not SIGINT).
     if let Err(e) = enable_raw_mode() {
