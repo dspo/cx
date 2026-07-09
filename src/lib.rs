@@ -19,6 +19,8 @@ use std::io::{self, Write as IoWrite};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 #[cfg(windows)]
 use std::os::windows::fs::{symlink_dir, symlink_file};
@@ -36,6 +38,8 @@ use cx_providers::{
 
 mod codex_app;
 mod probe;
+mod relay;
+mod session;
 mod stats;
 mod warp;
 
@@ -388,11 +392,7 @@ fn builtin_hidden_agent_configs() -> Vec<AgentConfig> {
         id: "codex+".into(),
         binary: "codex+".into(),
         args: Vec::new(),
-        wire_apis: vec![
-            "anthropic".into(),
-            "responses".into(),
-            "completions".into(),
-        ],
+        wire_apis: vec!["anthropic".into(), "responses".into(), "completions".into()],
         env: BTreeMap::new(),
     }]
 }
@@ -443,7 +443,10 @@ fn resolved_agents(config: &CxConfig) -> Vec<ResolvedAgent> {
     // 以尊重用户的显式配置（此时该 agent 不再隐藏）。
     for builtin in builtin_hidden_agent_configs() {
         let id = canonical_agent_id(&builtin.id).to_string();
-        if agents.iter().any(|existing: &ResolvedAgent| existing.id == id) {
+        if agents
+            .iter()
+            .any(|existing: &ResolvedAgent| existing.id == id)
+        {
             continue;
         }
         agents.push(ResolvedAgent {
@@ -1246,6 +1249,20 @@ enum CxCommand {
         #[arg(long, value_name = "PERIOD")]
         period: Option<String>,
     },
+    /// 向运行中的 cx agent session 注入一条消息（当作用户输入提交）
+    Send {
+        /// 精确指定目标 session id
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+        /// 按 agent 过滤（取最新）
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+        /// 选择最新启动的 session
+        #[arg(long)]
+        latest: bool,
+        /// 要注入的文本
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1265,6 +1282,12 @@ enum DispatchCommand {
         output: Option<String>,
         view: Option<String>,
         period: Option<String>,
+    },
+    Send {
+        session: Option<String>,
+        agent: Option<String>,
+        latest: bool,
+        text: String,
     },
     Launch {
         args: Vec<String>,
@@ -1300,6 +1323,17 @@ fn dispatch_command(raw_args: &[String]) -> DispatchCommand {
                 output,
                 view,
                 period,
+            },
+            Some(CxCommand::Send {
+                session,
+                agent,
+                latest,
+                text,
+            }) => DispatchCommand::Send {
+                session,
+                agent,
+                latest,
+                text,
             },
             None => DispatchCommand::Launch { args: Vec::new() },
         },
@@ -1371,6 +1405,12 @@ pub fn run() -> Result<()> {
             };
             stats::run_stats(config)
         }
+        DispatchCommand::Send {
+            session,
+            agent,
+            latest,
+            text,
+        } => run_send(session, agent, latest, text),
         DispatchCommand::Launch { args } => {
             // No subcommand or an unknown one → treat as Launch with optional agent hint.
             let config = load_config()?;
@@ -1428,6 +1468,65 @@ fn run_launcher(
 
     apply_selected_model_tab_name(&selection)?;
     launch_agent(spec)
+}
+
+/// `cx send`：向运行中的 cx agent session 注入一条消息。
+///
+/// 扫描 `~/.config/cx/sessions/*.json` 注册表，按选择器挑一个存活会话，
+/// 经其 Unix socket 发送 line-JSON `{"text": ...}`，由 relay 转写为 agent 输入。
+fn run_send(
+    session: Option<String>,
+    agent: Option<String>,
+    latest: bool,
+    text: String,
+) -> Result<()> {
+    let mut alive: Vec<_> = session::list_registries()
+        .into_iter()
+        .filter(|r| Path::new(&r.socket).exists() && session::socket_alive(Path::new(&r.socket)))
+        .collect();
+    if let Some(a) = &agent {
+        alive.retain(|r| &r.agent == a);
+    }
+    if let Some(id) = &session {
+        alive.retain(|r| &r.id == id);
+    }
+
+    let target = if session.is_some() || agent.is_some() {
+        alive
+            .into_iter()
+            .next()
+            .context("未找到匹配的活跃 session（用 `cx` 启动一个 agent 后再 send）")?
+    } else if latest {
+        alive.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        alive
+            .into_iter()
+            .next()
+            .context("没有活跃 session（用 `cx` 启动一个 agent 后再 send）")?
+    } else if alive.len() == 1 {
+        alive.into_iter().next().unwrap()
+    } else if alive.is_empty() {
+        bail!("没有活跃 session（用 `cx` 启动一个 agent 后再 send）");
+    } else {
+        eprintln!("多个活跃 session，请指定目标：");
+        for r in &alive {
+            eprintln!(
+                "  --session {}  (agent={}, started={})",
+                r.id, r.agent, r.started_at
+            );
+        }
+        bail!("请用 --session <ID> / --agent <NAME> / --latest 指定目标");
+    };
+
+    let mut stream = UnixStream::connect(&target.socket)
+        .with_context(|| format!("连接 session socket 失败: {}", target.socket))?;
+    let line = serde_json::to_string(&serde_json::json!({ "text": text }))
+        .context("序列化注入消息失败")?;
+    stream
+        .write_all(format!("{line}\n").as_bytes())
+        .context("写入 session socket 失败")?;
+    stream.flush().context("flush session socket 失败")?;
+    println!("已注入到 session {} ({})", target.id, target.agent);
+    Ok(())
 }
 fn apply_selected_model_tab_name(selection: &Selection) -> Result<()> {
     let Some(model_id) = selection
@@ -1877,6 +1976,14 @@ fn launch_agent(spec: LaunchSpec) -> Result<()> {
     // Warp 集成：在启动 agent 前发出 session_start 事件
     let warp_session = warp::maybe_emit_session_start(&spec.agent_id, spec.model_id.as_deref());
 
+    // PTY 中继路径：cx 持 master，终端 IO 透传，并暴露 IPC 注入入口。
+    // relay::run 自行打印摘要、spawn、进 raw mode、收尾，返回 `!`。
+    // Ctrl+C 在 raw mode 下作为 0x03 透传给 slave，由 agent 自处理，cx 不再被
+    // SIGINT 杀掉（直连 status() 路径的老限制）。`CX_PTY=0` 时 spec.pty 为 false，回退直连。
+    if spec.pty {
+        relay::run(&spec, &warp_session);
+    }
+
     // 将 Warp session ID 传递给子进程，以便 agent 的 hooks/plugins
     // 可以使用同一 session ID 发出后续 OSC 777 事件。
     if let Some(ref session) = warp_session {
@@ -1891,12 +1998,10 @@ fn launch_agent(spec: LaunchSpec) -> Result<()> {
     let started_at = std::time::Instant::now();
     let started_sys = std::time::SystemTime::now();
 
-    // spawn + wait：子进程继承 stdin/stdout/stderr，cx 作为静默父进程等待。
+    // 直连路径（CX_PTY=0）：spawn + wait，子进程继承 stdin/stdout/stderr，cx 作为静默父进程等待。
     //
-    // 信号行为：SIGINT/SIGWINCH 通过前台进程组自然传递给子进程和 cx 双方。
-    // 已知限制：若用户在 agent 运行时按 Ctrl+C，Rust 默认 SIGINT handler 会
-    // 立即终止 cx 进程，此时退出摘要和 Warp stop 事件不会触发。这是 spawn+wait
-    // 模式相对于 exec() 的固有代价；完整信号转发需要 signal-hook 等额外依赖。
+    // 已知限制：若用户在 agent 运行时按 Ctrl+C，Rust 默认 SIGINT handler 会立即终止 cx
+    // 进程，此时退出摘要和 Warp stop 事件不会触发。PTY 中继路径（默认）已规避此问题。
     let status = command
         .status()
         .with_context(|| format!("启动 `{}` 失败", spec.program.display()))?;
@@ -1924,13 +2029,44 @@ fn finalize_agent_exit(
     started_sys: std::time::SystemTime,
     warp_session: &Option<warp::WarpSession>,
 ) -> ! {
+    let exit_code = exit_code_from(status);
+    let termination = format_exit_status(status);
+    finalize_exit_common(
+        agent_id,
+        provider_name,
+        model_id,
+        started_at,
+        started_sys,
+        exit_code,
+        termination.as_deref(),
+        warp_session,
+        None,
+    )
+}
+
+/// Shared exit path for both the legacy `Command::status()` launch and the PTY
+/// relay: print the exit summary, emit the Warp stop event, clean up an optional
+/// IPC session, then exit with the given code.
+///
+/// `session_id` is `Some` only on the relay path, where it owns an IPC socket +
+/// registry file that must be removed before exit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_exit_common(
+    agent_id: &str,
+    provider_name: &str,
+    model_id: Option<&str>,
+    started_at: std::time::Instant,
+    started_sys: std::time::SystemTime,
+    exit_code: i32,
+    termination: Option<&str>,
+    warp_session: &Option<warp::WarpSession>,
+    session_id: Option<&str>,
+) -> ! {
     let duration = started_at.elapsed();
 
     // 从 agent 日志中提取本次会话的 token 用量
     let tokens = stats::count_recent_session_tokens(agent_id, started_sys);
 
-    // 打印退出摘要
-    let termination = format_exit_status(status);
     println!();
     println!(
         "{}",
@@ -1939,7 +2075,7 @@ fn finalize_agent_exit(
             provider_name,
             model_id,
             duration,
-            termination.as_deref(),
+            termination,
             tokens.as_ref(),
         )
     );
@@ -1947,11 +2083,14 @@ fn finalize_agent_exit(
 
     // Warp 集成：agent 退出后发出 stop 事件（WarpSession 的 Drop 也会兜底）
     if let Some(session) = warp_session {
-        session.emit_stop(status.code());
+        session.emit_stop(Some(exit_code));
     }
 
-    // 退出码：正常退出用 exit code，信号终止用 128+signal（与 shell 惯例一致）
-    let exit_code = exit_code_from(status);
+    // Relay path owns an IPC socket + registry; remove them so they don't linger.
+    if let Some(id) = session_id {
+        session::cleanup_session(id);
+    }
+
     std::process::exit(exit_code);
 }
 
@@ -2088,6 +2227,9 @@ struct LaunchSpec {
     provider_name: String,
     /// 选中的模型 ID，供 Warp 集成和退出摘要使用。
     model_id: Option<String>,
+    /// 是否经 PTY 中继启动（cx 持 master，终端 IO 透传），而非 `Command::status()` 直连。
+    /// `CX_PTY=0` 可强制关闭以回退到直连路径。
+    pty: bool,
 }
 
 fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Result<LaunchSpec> {
@@ -2250,6 +2392,9 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
         None => format!("启动 {} | Provider: {}", agent_id, provider.name),
     };
 
+    // PTY 中继默认对全体非 detach agent 启用；`CX_PTY=0` 回退到直连 status() 路径。
+    let pty = env::var("CX_PTY").ok().as_deref() != Some("0");
+
     Ok(LaunchSpec {
         program,
         args,
@@ -2260,6 +2405,7 @@ fn build_launch_spec(selection: &Selection, passthrough_args: &[String]) -> Resu
         agent_id: agent_id.clone(),
         provider_name: provider.name.clone(),
         model_id: selection.model.as_ref().map(|m| m.id.clone()),
+        pty,
     })
 }
 
@@ -4260,7 +4406,10 @@ mod tests {
         };
         let spec = build_launch_spec(&selection, &[]).unwrap();
         assert_eq!(spec.env.get("CX_MODEL"), Some(&"glm-5.2".to_string()));
-        assert_eq!(spec.env.get("ANTHROPIC_MODEL"), Some(&"glm-5.2".to_string()));
+        assert_eq!(
+            spec.env.get("ANTHROPIC_MODEL"),
+            Some(&"glm-5.2".to_string())
+        );
         assert!(spec.args.iter().any(|a| a == "glm-5.2"));
         assert!(!spec.args.iter().any(|a| a.contains("[1m]")));
         let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
@@ -5211,7 +5360,11 @@ trust_level = "trusted"
         // codex+ 支持 3 种 wire api；config.toml 必须写出 codex 家族词汇。
         let merged = merge_codex_config(
             None,
-            &test_resolved_model("claude-sonnet", "https://api.anthropic.com", WireApi::Anthropic),
+            &test_resolved_model(
+                "claude-sonnet",
+                "https://api.anthropic.com",
+                WireApi::Anthropic,
+            ),
             Path::new("/tmp/workspace"),
             WireApi::Anthropic,
             "anthropic",
@@ -5307,11 +5460,20 @@ trust_level = "trusted"
 
     #[test]
     fn parse_model_context_suffix_handles_known_shapes() {
-        assert_eq!(parse_model_context_suffix("glm-5.2[1m]"), ("glm-5.2", Some(1_000_000)));
-        assert_eq!(parse_model_context_suffix("model[3m]"), ("model", Some(3_000_000)));
+        assert_eq!(
+            parse_model_context_suffix("glm-5.2[1m]"),
+            ("glm-5.2", Some(1_000_000))
+        );
+        assert_eq!(
+            parse_model_context_suffix("model[3m]"),
+            ("model", Some(3_000_000))
+        );
         assert_eq!(parse_model_context_suffix("gpt-4o"), ("gpt-4o", None));
         // 不匹配的尾缀原样保留。
-        assert_eq!(parse_model_context_suffix("model[1mm]"), ("model[1mm]", None));
+        assert_eq!(
+            parse_model_context_suffix("model[1mm]"),
+            ("model[1mm]", None)
+        );
         assert_eq!(parse_model_context_suffix("[1m]"), ("", Some(1_000_000)));
     }
 
@@ -5337,9 +5499,11 @@ trust_level = "trusted"
         assert_eq!(codex_plus.unwrap().binary, "codex+");
 
         // 用户可见列表与 add 向导均过滤掉 codex+。
-        assert!(available_agents_for_add(&config)
-            .iter()
-            .all(|a| a.id != "codex+"));
+        assert!(
+            available_agents_for_add(&config)
+                .iter()
+                .all(|a| a.id != "codex+")
+        );
 
         // find_agent 仍能命中 codex+（显式 `cx codex+` 可进入）。
         assert!(find_agent(&config, "codex+").is_some());
@@ -5651,6 +5815,7 @@ trust_level = "trusted"
             agent_id: "claude".into(),
             provider_name: "百炼".into(),
             model_id: Some("MiniMax-M2.7".into()),
+            pty: false,
         };
         let msg = format_exit_summary(&spec, Duration::from_secs(192), None, None);
         assert_eq!(
@@ -5671,6 +5836,7 @@ trust_level = "trusted"
             agent_id: "copilot".into(),
             provider_name: "default".into(),
             model_id: None,
+            pty: false,
         };
         let msg = format_exit_summary(&spec, Duration::from_secs(45), None, None);
         assert_eq!(
@@ -5691,6 +5857,7 @@ trust_level = "trusted"
             agent_id: "codex".into(),
             provider_name: "DashScope".into(),
             model_id: Some("qwen-max".into()),
+            pty: false,
         };
         let msg = format_exit_summary(&spec, Duration::from_secs(10), Some("exit 1"), None);
         assert_eq!(
@@ -5711,6 +5878,7 @@ trust_level = "trusted"
             agent_id: "claude".into(),
             provider_name: "Anthropic".into(),
             model_id: Some("opus-4.7".into()),
+            pty: false,
         };
         let msg = format_exit_summary(&spec, Duration::from_secs(5), Some("signal 9"), None);
         assert_eq!(
@@ -5731,6 +5899,7 @@ trust_level = "trusted"
             agent_id: "claude".into(),
             provider_name: "百炼".into(),
             model_id: Some("MiniMax-M2.7".into()),
+            pty: false,
         };
         let tokens = stats::SessionTokens {
             input: 100_000,
