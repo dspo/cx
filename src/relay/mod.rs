@@ -2,18 +2,20 @@
 // terminal, and the user terminal is bridged to it byte-for-byte. A Unix socket
 // per session lets external processes inject messages (see `cx send`).
 //
-// This module owns the full lifecycle for the PTY launch path and returns `!`:
-// spawn → raw mode → relay → EOF → wait → finalize (summary + warp stop +
-// IPC cleanup) → process::exit.
+// This module is the CLI driver over `api::SessionHandle`: it prints the banner,
+// advertises the socket, enters raw mode, forwards stdin, pumps master output
+// to stdout, and finalizes on EOF — returning `!` via `process::exit`. The
+// handle owns the spawn/IPC/writer-thread lifecycle; `relay::run` owns the
+// terminal interaction.
 
 pub(crate) mod ipc;
 pub(crate) mod pty;
 pub(crate) mod transfer;
 
 use std::io::Write;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, mpsc};
-use std::time::{Instant, SystemTime};
+use std::time::SystemTime;
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use portable_pty::ExitStatus as PtyExitStatus;
@@ -21,133 +23,121 @@ use signal_hook::consts::signal::SIGWINCH;
 use signal_hook::flag as sig_flag;
 
 use crate::LaunchSpec;
-use crate::session::{self, SessionRegistry};
+use crate::api::SessionHandle;
 use crate::warp::WarpSession;
 
-use pty::{PtySession, spawn_pty};
-use transfer::{WriteReq, master_to_stdout, stdin_forward, writer_loop};
+use transfer::stdin_forward;
 
 /// Run the agent through a PTY relay, accepting IPC injections.
 ///
-/// Owns the lifecycle and returns `!` via `finalize_exit_common`.
-pub(crate) fn run(spec: &LaunchSpec, warp_session: &Option<WarpSession>) -> ! {
-    let session_id = session::generate_session_id();
-    let started_at = Instant::now();
+/// Owns the terminal interaction and returns `!` via `process::exit`. The
+/// spawn/IPC/writer lifecycle is delegated to `SessionHandle`.
+pub(crate) fn run(spec: &LaunchSpec, warp_session: Option<WarpSession>) -> ! {
     let started_sys = SystemTime::now();
 
-    // Launch banner in cooked mode before raw mode swallows the newlines. The socket
-    // line is appended once the IPC bind succeeds (below), so only a live socket is
-    // advertised; a trailing blank separates the banner from the agent's raw output.
+    // Launch banner in cooked mode before raw mode swallows the newlines. The
+    // socket line is appended once the handle has bound its IPC socket (below),
+    // so only a live socket is advertised; a trailing blank separates the banner
+    // from the agent's raw output.
     println!();
     println!("{}", spec.summary);
     let _ = std::io::stdout().flush();
 
-    let pty = match spawn_pty(spec, &warp_env(warp_session)) {
-        Ok(p) => p,
+    let handle = match SessionHandle::spawn(spec, warp_session) {
+        Ok(h) => h,
         Err(e) => {
             eprintln!("cx: {e:#}");
-            session::cleanup_session(&session_id);
             std::process::exit(1);
         }
     };
-    let PtySession {
-        master,
-        mut child,
-        reader,
-        writer,
-    } = pty;
 
-    // IPC is best-effort: the relay still works without external injection.
-    //
-    // The socket path is a `--socket` override when given, else the default
-    // ~/.config/cx/sessions/<id>.sock. The registry advertises whichever is bound,
-    // so `cx send` finds the session regardless of which path was used.
-    let (tx, rx) = mpsc::channel::<WriteReq>();
-    let sock_path = match spec.socket.as_deref() {
-        Some(p) => Ok(std::path::PathBuf::from(p)),
-        None => session::socket_path(&session_id),
-    };
-    match sock_path {
-        Ok(sock) => match ipc::IpcServer::bind(&sock) {
-            Ok(ipc) => {
-                ipc.accept_loop(tx.clone());
-                let reg = SessionRegistry {
-                    id: session_id.clone(),
-                    socket: sock.to_string_lossy().into_owned(),
-                    pid: std::process::id(),
-                    agent: spec.agent_id.clone(),
-                    model: spec.model_id.clone(),
-                    provider: spec.provider_name.clone(),
-                    started_at: chrono::Utc::now().to_rfc3339(),
-                    cwd: std::env::current_dir()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                };
-                let _ = session::write_registry(&reg);
-                // Advertise the injection socket while still in cooked mode, before raw
-                // mode swallows the output. External processes (e.g. `cx send`) connect
-                // here to inject messages as if the user typed them.
-                println!("socket: {}", sock.display());
-                let _ = std::io::stdout().flush();
-            }
-            Err(e) => eprintln!("cx: IPC 绑定失败（外部注入不可用）: {e}"),
-        },
-        Err(e) => eprintln!("cx: 解析 socket 路径失败（外部注入不可用）: {e}"),
+    // Advertise the injection socket while still in cooked mode, before raw mode
+    // swallows the output. Only a successfully bound socket is advertised — a
+    // failed bind prints nothing rather than a dead path. External processes
+    // (e.g. `cx send`) connect here to inject messages as if the user typed them.
+    if let Some(sock) = handle.socket_path() {
+        println!("socket: {}", sock.display());
+        let _ = std::io::stdout().flush();
     }
 
-    // Blank separator between the banner and the agent's raw output, flushed so it
-    // lands before raw mode takes over.
+    // Blank separator between the banner and the agent's raw output, flushed so
+    // it lands before raw mode takes over.
     println!();
     let _ = std::io::stdout().flush();
 
     // Enter raw mode so keystrokes pass through verbatim (Ctrl+C = 0x03, not SIGINT).
     if let Err(e) = enable_raw_mode() {
         eprintln!("cx: 进入 raw mode 失败: {e}");
-        let _ = child.kill();
-        let status = child
-            .wait()
-            .unwrap_or_else(|_| PtyExitStatus::with_exit_code(1));
-        finalize_relay(
-            spec,
-            &status,
-            started_at,
-            started_sys,
-            warp_session,
-            &session_id,
-        );
+        let res = handle.kill_wait();
+        print_exit_summary(&res, started_sys);
+        std::process::exit(res.exit_code);
     }
     let _raw_guard = RawGuard;
 
     // SIGWINCH → resize flag, polled by the writer loop.
-    let resize_flag = Arc::new(AtomicBool::new(false));
-    if let Err(e) = sig_flag::register(SIGWINCH, Arc::clone(&resize_flag)) {
+    let resize_flag: Arc<AtomicBool> = handle.resize_flag();
+    if let Err(e) = sig_flag::register(SIGWINCH, resize_flag) {
         eprintln!("cx: 注册 SIGWINCH 失败（窗口缩放将不生效）: {e}");
     }
 
-    stdin_forward(tx);
-    writer_loop(writer, rx, master, resize_flag);
+    stdin_forward(handle.writer_tx().clone());
 
-    // Main thread blocks here until the agent closes its stdout (EOF = exit).
-    if let Err(e) = master_to_stdout(reader) {
-        eprintln!("cx: master 读取失败: {e}");
+    // Pump master output to stdout, flushing per write so the agent's TUI renders
+    // without buffering stalls. EOF (read 0) means the agent closed its stdout.
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut buf = [0u8; 8192];
+    loop {
+        match handle.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let _ = out.write_all(&buf[..n]);
+                let _ = out.flush();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                eprintln!("cx: master 读取失败: {e}");
+                break;
+            }
+        }
     }
 
-    let status = child
-        .wait()
-        .unwrap_or_else(|_| PtyExitStatus::with_exit_code(1));
+    // Reap the child, clean up IPC, emit Warp stop. The handle owns all of this.
+    // After EOF the agent is exiting; `wait` blocks until it does (mirrors the
+    // pre-refactor `child.wait()`).
+    let res = match handle.wait() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("cx: reap 失败: {e:#}");
+            std::process::exit(1);
+        }
+    };
     let _ = disable_raw_mode();
-    finalize_relay(
-        spec,
-        &status,
-        started_at,
-        started_sys,
-        warp_session,
-        &session_id,
+    print_exit_summary(&res, started_sys);
+    std::process::exit(res.exit_code);
+}
+
+/// Print the inline exit summary (agent/provider/model/duration/tokens/termination),
+/// matching `finalize_exit_common`'s formatting for the direct-launch path.
+fn print_exit_summary(res: &crate::SessionResult, started_sys: SystemTime) {
+    let tokens = crate::stats::count_recent_session_tokens(&res.agent_id, started_sys);
+    println!();
+    println!(
+        "{}",
+        crate::format_exit_summary_inline(
+            &res.agent_id,
+            &res.provider_name,
+            res.model_id.as_deref(),
+            res.duration,
+            res.termination.as_deref(),
+            tokens.as_ref(),
+        )
     );
+    println!();
 }
 
 /// Build the relay-time env slice (currently just the Warp session id, if any).
-fn warp_env(warp_session: &Option<WarpSession>) -> Vec<(&'static str, String)> {
+pub(crate) fn warp_env(warp_session: &Option<WarpSession>) -> Vec<(&'static str, String)> {
     match warp_session {
         Some(ws) => vec![("CX_WARP_SESSION_ID", ws.session_id().to_string())],
         None => Vec::new(),
@@ -168,7 +158,7 @@ impl Drop for RawGuard {
 /// `portable_pty` collapses signal deaths to `exit_code()==1` and keeps only the
 /// `strsignal` description (e.g. "Terminated"), so the 128+signal convention is
 /// best-effort; unmapped signals fall back to the reported exit code.
-fn pty_exit_code(status: &PtyExitStatus) -> i32 {
+pub(crate) fn pty_exit_code(status: &PtyExitStatus) -> i32 {
     if status.success() {
         return 0;
     }
@@ -192,34 +182,4 @@ fn signal_number(desc: &str) -> Option<i32> {
         "Terminated" => Some(libc::SIGTERM),
         _ => None,
     }
-}
-
-/// Relay-side exit finalize: compute exit code/termination, then delegate to the
-/// shared `finalize_exit_common` which prints the summary, emits Warp stop,
-/// cleans up the IPC session, and `process::exit`s.
-fn finalize_relay(
-    spec: &LaunchSpec,
-    status: &PtyExitStatus,
-    started_at: Instant,
-    started_sys: SystemTime,
-    warp_session: &Option<WarpSession>,
-    session_id: &str,
-) -> ! {
-    let exit_code = pty_exit_code(status);
-    let termination: Option<String> = if status.success() && exit_code == 0 {
-        None
-    } else {
-        Some(status.to_string())
-    };
-    crate::finalize_exit_common(
-        &spec.agent_id,
-        &spec.provider_name,
-        spec.model_id.as_deref(),
-        started_at,
-        started_sys,
-        exit_code,
-        termination.as_deref(),
-        warp_session,
-        Some(session_id),
-    )
 }

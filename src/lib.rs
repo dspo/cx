@@ -43,6 +43,10 @@ mod session;
 mod stats;
 mod warp;
 
+/// Programmatic agent launch API (builder + live session handle).
+pub mod api;
+pub use api::{Agent, AgentBuilder, SessionHandle, SessionResult};
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const LAUNCH_HOME_DIR_NAME: &str = "cx-launch-homes";
 const LAUNCH_HOME_TTL_SECS: u64 = 60 * 60 * 24;
@@ -2049,8 +2053,10 @@ fn launch_agent(spec: LaunchSpec) -> Result<()> {
     // relay::run 自行打印摘要、spawn、进 raw mode、收尾，返回 `!`。
     // Ctrl+C 在 raw mode 下作为 0x03 透传给 slave，由 agent 自处理，cx 不再被
     // SIGINT 杀掉（直连 status() 路径的老限制）。未传 --pty 时 spec.pty 为 false，走下方直连。
+    // `warp_session` 按值传入：relay 路径拥有配对的 stop 事件；该分支发散（`-> !`），
+    // 故直连路径仍可继续借用 warp_session。
     if spec.pty {
-        relay::run(&spec, &warp_session);
+        relay::run(&spec, warp_session);
     }
 
     // 将 Warp session ID 传递给子进程，以便 agent 的 hooks/plugins

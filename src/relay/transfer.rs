@@ -14,13 +14,16 @@ use std::time::Duration;
 use crossterm::terminal;
 use portable_pty::{MasterPty, PtySize};
 
-/// A unit of work for the master writer thread: bytes to write to the master.
+/// A unit of work for the master writer thread.
 ///
-/// The relay tears down via `process::exit` (the agent's EOF ends the main thread,
-/// which finalizes and exits), so there is no shutdown message — stdin and IPC
-/// both send `Bytes` only.
+/// `Bytes` carries stdin/IPC input to write to the master; `Resize` carries an
+/// explicit window size (library API) to apply to the master's kernel winsize.
+/// The relay tears down via `process::exit` (the agent's EOF ends the main
+/// thread, which finalizes and exits), so there is no shutdown message — stdin
+/// and IPC both send `Bytes` only.
 pub(crate) enum WriteReq {
     Bytes(Vec<u8>),
+    Resize(u16, u16),
 }
 
 /// Read raw stdin verbatim and forward to the writer channel.
@@ -44,25 +47,6 @@ pub(crate) fn stdin_forward(tx: mpsc::Sender<WriteReq>) {
     });
 }
 
-/// Pump master output to stdout, flushing after every write so the agent's TUI
-/// renders without buffering stalls. Returns on EOF (agent exited).
-pub(crate) fn master_to_stdout(mut reader: Box<dyn Read + Send>) -> std::io::Result<()> {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let mut buf = [0u8; 8192];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => return Ok(()),
-            Ok(n) => {
-                out.write_all(&buf[..n])?;
-                out.flush()?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 /// Consume the writer channel and write to the master, serializing stdin/IPC.
 ///
 /// Uses `recv_timeout` so a blocked receive still wakes periodically to service
@@ -81,6 +65,14 @@ pub(crate) fn writer_loop(
                         break; // master closed
                     }
                     let _ = writer.flush();
+                }
+                Ok(WriteReq::Resize(cols, rows)) => {
+                    let _ = master.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if resize_flag.swap(false, Ordering::Relaxed) {
@@ -151,6 +143,7 @@ mod tests {
             .expect("expected a Bytes request");
         match req {
             WriteReq::Bytes(b) => assert_eq!(b, b"hello world\n"),
+            WriteReq::Resize(..) => panic!("expected Bytes, got Resize"),
         }
     }
 
@@ -168,6 +161,7 @@ mod tests {
             .expect("expected the valid request after skipped lines");
         match req {
             WriteReq::Bytes(b) => assert_eq!(b, b"ok\n"),
+            WriteReq::Resize(..) => panic!("expected Bytes, got Resize"),
         }
     }
 
