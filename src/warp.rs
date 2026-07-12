@@ -9,11 +9,11 @@
 // JSON 信封字段: v, agent, event, session_id, cwd, project（+ 可选扩展字段）
 
 use serde::Serialize;
-use std::cell::Cell;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 检查当前终端是否支持 Warp CLI agent 协议。
 fn is_warp_terminal() -> bool {
@@ -51,7 +51,7 @@ pub struct WarpSession {
     agent_id: String,
     session_id: String,
     model: Option<String>,
-    stopped: Cell<bool>,
+    stopped: AtomicBool,
 }
 
 impl WarpSession {
@@ -65,10 +65,10 @@ impl WarpSession {
     /// 幂等：多次调用只发出一次事件。
     /// `exit_code` 为 agent 进程的退出码；异常退出（信号终止等）时为 `None`。
     pub fn emit_stop(&self, exit_code: Option<i32>) {
-        if self.stopped.get() {
+        if self.stopped.load(Ordering::Relaxed) {
             return;
         }
-        self.stopped.set(true);
+        self.stopped.store(true, Ordering::Relaxed);
         emit_event(&AgentEvent {
             v: 1,
             agent: self.agent_id.clone(),
@@ -84,7 +84,7 @@ impl WarpSession {
 
 impl Drop for WarpSession {
     fn drop(&mut self) {
-        if !self.stopped.get() {
+        if !self.stopped.load(Ordering::Relaxed) {
             emit_event(&AgentEvent {
                 v: 1,
                 agent: self.agent_id.clone(),
@@ -113,7 +113,7 @@ pub fn maybe_emit_session_start(agent_id: &str, model: Option<&str>) -> Option<W
         agent_id: agent_id.to_string(),
         session_id,
         model: model.map(|s| s.to_string()),
-        stopped: Cell::new(false),
+        stopped: AtomicBool::new(false),
     };
 
     emit_event(&AgentEvent {

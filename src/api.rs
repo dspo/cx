@@ -241,7 +241,7 @@ pub struct SessionResult {
 pub struct SessionHandle {
     child: Mutex<Option<Box<dyn portable_pty::Child + Send>>>,
     reader: Mutex<Box<dyn Read + Send>>,
-    writer_tx: mpsc::Sender<WriteReq>,
+    writer_tx: Mutex<mpsc::Sender<WriteReq>>,
     resize_flag: Arc<AtomicBool>,
     accept_shutdown: Arc<AtomicBool>,
     session_id: String,
@@ -316,7 +316,7 @@ impl SessionHandle {
         Ok(Self {
             child: Mutex::new(Some(child)),
             reader: Mutex::new(reader),
-            writer_tx: tx,
+            writer_tx: Mutex::new(tx),
             resize_flag,
             accept_shutdown,
             session_id,
@@ -345,6 +345,8 @@ impl SessionHandle {
         let mut bytes = text.as_bytes().to_vec();
         bytes.push(b'\n');
         self.writer_tx
+            .lock()
+            .expect("writer_tx mutex poisoned")
             .send(WriteReq::Bytes(bytes))
             .map_err(|_| anyhow!("agent 已退出，写入失败"))
     }
@@ -361,6 +363,8 @@ impl SessionHandle {
     /// not `Sync`.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
         self.writer_tx
+            .lock()
+            .expect("writer_tx mutex poisoned")
             .send(WriteReq::Resize(cols, rows))
             .map_err(|_| anyhow!("agent 已退出，resize 失败"))
     }
@@ -371,8 +375,11 @@ impl SessionHandle {
         self.resize_flag.clone()
     }
 
-    pub(crate) fn writer_tx(&self) -> &mpsc::Sender<WriteReq> {
-        &self.writer_tx
+    pub(crate) fn writer_tx(&self) -> mpsc::Sender<WriteReq> {
+        self.writer_tx
+            .lock()
+            .expect("writer_tx mutex poisoned")
+            .clone()
     }
 
     /// Block until the agent exits naturally, then clean up (IPC socket +
@@ -466,6 +473,16 @@ impl Drop for SessionHandle {
         }
     }
 }
+
+/// Compile-time guarantee that a `SessionHandle` is shareable behind `Arc`
+/// across threads — a host (manox) reads from a background thread, writes /
+/// resizes from the UI thread, and reaps from a waiter thread.
+const _: () = {
+    fn _assert_send_sync<T: Send + Sync>() {}
+    fn _f() {
+        _assert_send_sync::<SessionHandle>();
+    }
+};
 
 #[cfg(test)]
 mod tests {

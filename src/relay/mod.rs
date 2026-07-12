@@ -81,7 +81,7 @@ pub(crate) fn run(spec: &LaunchSpec, warp_session: Option<WarpSession>) -> ! {
         eprintln!("cx: 注册 SIGWINCH 失败（窗口缩放将不生效）: {e}");
     }
 
-    stdin_forward(handle.writer_tx().clone());
+    stdin_forward(handle.writer_tx());
 
     // Pump master output to stdout, flushing per write so the agent's TUI renders
     // without buffering stalls. EOF (read 0) means the agent closed its stdout.
