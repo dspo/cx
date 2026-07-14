@@ -53,7 +53,7 @@ pub struct SendTarget {
 /// `text` clears the input area and a non-empty one overwrites it.
 pub fn send(selector: &SendSelector, text: Option<&str>, clear_buffer: bool) -> Result<SendTarget> {
     if text.is_none() && !clear_buffer {
-        bail!("请提供 text，或设置 clear_buffer 清空输入区");
+        bail!("请提供 text，或加 --clear-buffer 清空输入区");
     }
 
     let alive: Vec<SessionRegistry> = session::list_registries()
@@ -121,9 +121,14 @@ pub(crate) fn resolve_session<'a>(
 pub(crate) fn compose_effective(text: Option<&str>, clear_buffer: bool) -> String {
     match (text, clear_buffer) {
         (Some(t), true) => format!("{CLEAR_INPUT}{t}"),
+        // Ctrl+U then the relay's appended '\n': claude code clears the input box
+        // on Ctrl+U and ignores the subsequent empty submit, so the net effect is a
+        // cleared box.
         (None, true) => CLEAR_INPUT.to_string(),
         (Some(t), false) => t.to_string(),
-        (None, false) => String::new(), // unreachable: validated by `send`
+        (None, false) => {
+            unreachable!("caller must pass text or clear_buffer (validated by `send`)")
+        }
     }
 }
 
@@ -138,7 +143,7 @@ pub(crate) fn parse_selector(session: Option<&str>) -> SendSelector {
         "claude" => SendSelector::Agent(Agent::Claude),
         "codex" => SendSelector::Agent(Agent::Codex),
         "copilot" => SendSelector::Agent(Agent::Copilot),
-        _ => SendSelector::Id(value.to_string()),
+        _ => SendSelector::Id(value.to_ascii_lowercase()),
     }
 }
 
@@ -264,7 +269,7 @@ mod tests {
     #[test]
     fn send_rejects_empty_without_clear() {
         let err = send(&SendSelector::Latest, None, false).unwrap_err();
-        assert!(format!("{err}").contains("clear_buffer"));
+        assert!(format!("{err}").contains("--clear-buffer"));
     }
 
     #[test]
@@ -282,7 +287,8 @@ mod tests {
             parse_selector(Some("CODEX")),
             SendSelector::Agent(Agent::Codex)
         ));
-        match parse_selector(Some("deadbeef")) {
+        // ids are 32-hex lowercase; an uppercase id is lowercased to match.
+        match parse_selector(Some("DeadBeef")) {
             SendSelector::Id(s) => assert_eq!(s, "deadbeef"),
             _ => panic!("expected Id"),
         }
